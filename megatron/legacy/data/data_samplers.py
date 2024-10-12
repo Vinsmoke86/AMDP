@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 from megatron.training import get_args
 from megatron.core import mpu
 
+bdpp_called_times = 0
 
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
@@ -20,12 +21,37 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     # Megatron sampler
     if args.dataloader_type == 'single':
-        batch_sampler = MegatronPretrainingSampler(
-            total_samples=len(dataset),
-            consumed_samples=consumed_samples,
-            micro_batch_size=args.micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size())
+        global bdpp_called_times
+        if args.enable_bidirectional_pipeline == True:
+
+            batch_sampler = MegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=args.micro_batch_size,
+                data_parallel_rank=(bdpp_called_times // 3 + 2*mpu.get_data_parallel_rank()),
+                data_parallel_size=2*mpu.get_data_parallel_world_size())
+            bdpp_called_times+=1
+            # batch_sampler = MegatronPretrainingSampler(
+            #     total_samples=len(dataset),
+            #     consumed_samples=consumed_samples,
+            #     micro_batch_size=args.micro_batch_size,
+            #     data_parallel_rank=mpu.get_data_parallel_rank(),
+            #     data_parallel_size=mpu.get_data_parallel_world_size())
+        elif args.enable_fourdirectional_pipeline == True:
+            batch_sampler = MegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=args.micro_batch_size,
+                data_parallel_rank=(bdpp_called_times // 3 + 4*mpu.get_data_parallel_rank()),
+                data_parallel_size=4*mpu.get_data_parallel_world_size())
+            bdpp_called_times+=1
+        else:    
+            batch_sampler = MegatronPretrainingSampler(
+                total_samples=len(dataset),
+                consumed_samples=consumed_samples,
+                micro_batch_size=args.micro_batch_size,
+                data_parallel_rank=mpu.get_data_parallel_rank(),
+                data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,

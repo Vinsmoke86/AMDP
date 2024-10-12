@@ -12,6 +12,7 @@ from torch import inf
 
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
+from megatron.training.global_vars import get_args
 
 
 def clip_grad_norm_fp32(
@@ -95,9 +96,11 @@ def clip_grad_norm_fp32(
                 total_norm += grad_norm ** norm_type
 
         # Sum across all model-parallel GPUs.
-        torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
-        )
+        args = get_args()
+        if args.enable_asynchronous_pipeline is False:
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
+            )
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
     # Scale.

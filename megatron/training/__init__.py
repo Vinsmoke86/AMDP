@@ -18,4 +18,5 @@ from .training import pretrain
 
 from .utils import (print_rank_0,
                     is_last_rank,
-                    print_rank_last)
+                    print_rank_last,
+                    training_log)

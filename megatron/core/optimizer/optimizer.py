@@ -24,6 +24,7 @@ from ..transformer.module import param_is_not_shared
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
+from megatron.training.global_vars import get_args
 
 logger = getLogger(__name__)
 
@@ -287,9 +288,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         )
 
         # Update across all model parallel instances.
-        torch.distributed.all_reduce(
-            self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
-        )
+        args = get_args()
+        if args.enable_asynchronous_pipeline is False:
+            torch.distributed.all_reduce(
+                self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
+            )
 
         # Check for nan.
         found_inf_flag = self.found_inf.item() > 0
@@ -686,6 +689,11 @@ class FP32Optimizer(MegatronOptimizer):
 
     def state_dict(self):
         return self.optimizer.state_dict()
+
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False
+    ):
+        return self.optimizer.sharded_state_dict(ShardedStateDict, is_loading)
 
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict)

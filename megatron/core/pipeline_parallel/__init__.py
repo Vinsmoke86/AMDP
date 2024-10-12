@@ -1,1 +1,2 @@
 from .schedules import get_forward_backward_func
+from .async_schedules import get_async_traing_func

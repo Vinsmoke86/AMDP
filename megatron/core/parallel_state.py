@@ -8,6 +8,7 @@ from datetime import timedelta
 from typing import Optional
 
 import torch
+import torch.distributed
 
 from .utils import GlobalMemoryBuffer
 
@@ -15,10 +16,16 @@ from .utils import GlobalMemoryBuffer
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
+# Mirrored model stage group that the current rank belongs to.
+_BIDIRECTIONAL_PIPELINE_MIRROR_GROUP = None
+# Mirrored model stage group that the current rank belongs to.
+_FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
 _MODEL_PARALLEL_GROUP = None
 # Embedding group.
 _EMBEDDING_GROUP = None
+# Main Embedding group, only used in fdpp now.
+_MAIN_EMBEDDING_GROUP = None
 # Position embedding group.
 _POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
@@ -43,10 +50,15 @@ _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_TENSOR_MODEL_PARALLEL_RANK = None
 _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
+_MPU_BIDERECTIONAL_PIPELINE_CURRENT_RANK = None
+_MPU_FOURDERECTIONAL_PIPELINE_CURRENT_RANK = None
 _MPU_EXPERT_MODEL_PARALLEL_RANK = None
 
 # A list of ranks that have a copy of the embedding.
 _EMBEDDING_GLOBAL_RANKS = None
+
+# A list of ranks that have a copy of the embedding.
+_MAIN_EMBEDDING_GLOBAL_RANKS = None
 
 # A list of ranks that have a copy of the position embedding.
 _POSITION_EMBEDDING_GLOBAL_RANKS = None
@@ -101,6 +113,8 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
+    enable_bidirectional_pipeline: bool = False,
+    enable_fourdirectional_pipeline: bool = False,
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
@@ -275,6 +289,8 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
     all_data_parallel_group_ranks_with_cp = []
+    # 有几个stage就有几个数据并行的通信组，一个stage就有一个数据并行做该stage的同步
+    # 以16卡为例 0 1 2 3 stage1  4 5 6 7 stage2  8 9 10 11 stage3  12 13 14 15 stage4
     for i in range(pipeline_model_parallel_size):
         start_rank = i * num_pipeline_model_parallel_groups
         end_rank = (i + 1) * num_pipeline_model_parallel_groups
@@ -387,6 +403,7 @@ def initialize_model_parallel(
     global _POSITION_EMBEDDING_GROUP
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
+    # 以16张卡为例 0->4->8->12  1->5->9->13  2->6->10->14 3->7->11->15
     for i in range(num_pipeline_model_parallel_groups):
         ranks = range(i, world_size, num_pipeline_model_parallel_groups)
         group = torch.distributed.new_group(
@@ -397,7 +414,10 @@ def initialize_model_parallel(
             _PIPELINE_GLOBAL_RANKS = ranks
         # Setup embedding group (to exchange gradients between
         # first and last stages).
-        if len(ranks) > 1:
+        if enable_fourdirectional_pipeline:
+            embedding_ranks = [ranks[0], ranks[3], ranks[4], ranks[7]]
+            position_embedding_ranks = [ranks[0]]
+        elif len(ranks) > 1:
             embedding_ranks = [ranks[0], ranks[-1]]
             position_embedding_ranks = [ranks[0]]
             if pipeline_model_parallel_split_rank is not None:
@@ -430,6 +450,61 @@ def initialize_model_parallel(
             _POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+
+    global _MAIN_EMBEDDING_GROUP
+    global _MAIN_EMBEDDING_GLOBAL_RANKS
+    assert _MAIN_EMBEDDING_GROUP is None, 'embedding group is already initialized'
+    if enable_fourdirectional_pipeline == True:
+        pp_group = get_pipeline_model_parallel_group()
+        pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+        ranks = [pp_ranks[0], pp_ranks[-1]]
+        group = torch.distributed.new_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('membd', nccl_comm_cfgs)
+        )
+        if rank in ranks:
+            _MAIN_EMBEDDING_GROUP = group
+        if rank in pp_ranks:
+            _MAIN_EMBEDDING_GLOBAL_RANKS = ranks
+
+    # Build bidirectional groups
+    global _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP
+    assert _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP is None, 'bdpp mirror group is already initialized'
+    if enable_bidirectional_pipeline == True:
+        assert pipeline_model_parallel_size == 4, 'bdpp only support 4-way pipeline parallelism'
+        pp_size  = get_pipeline_model_parallel_world_size()
+        pp_group = get_pipeline_model_parallel_group()
+        pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+        for i in range(pp_size // 2):
+            ranks = [pp_ranks[i], pp_ranks[- 1 - i]]
+            group = torch.distributed.new_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('bdpp', nccl_comm_cfgs)
+            )
+            if rank in ranks:
+                _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP = group
+        torch.distributed.barrier()
+
+    # Build fourdirectional groups
+    global _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP
+    assert _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP is None, 'fdpp mirror group is already initialized'
+    if enable_fourdirectional_pipeline == True:
+        assert pipeline_model_parallel_size == 8, 'bdpp only support 8-way pipeline parallelism'
+        pp_size  = get_pipeline_model_parallel_world_size()
+        pp_group = get_pipeline_model_parallel_group()
+        pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+        for i in range(pp_size // 4):
+            ranks = [pp_ranks[i], pp_ranks[i + 4], pp_ranks[- 5 - i], pp_ranks[- 1 - i]]
+            group = torch.distributed.new_group(
+                ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('fdpp', nccl_comm_cfgs)
+            )
+            if rank in ranks:
+                _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP = group
+        torch.distributed.barrier()
 
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
@@ -526,6 +601,13 @@ def is_unitialized() -> bool:
     )
     return not is_initialized()
 
+def is_bidirectional_pipeline():
+    global _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP
+    return _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP is not None
+
+def is_fourdirectional_pipeline():
+    global _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP
+    return _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP is not None
 
 def model_parallel_is_initialized():
     """Check if model and data parallel groups are initialized."""
@@ -559,6 +641,32 @@ def get_pipeline_model_parallel_group():
         _PIPELINE_MODEL_PARALLEL_GROUP is not None
     ), 'pipeline_model parallel group is not initialized'
     return _PIPELINE_MODEL_PARALLEL_GROUP
+
+def get_bidirectional_pipeline_mirror_group():
+    """Get the pipeline model parallel group the caller rank belongs to."""
+    assert (
+        _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP is not None
+    ), 'bidirectional pipeline mirror group is not initialized'
+    return _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP
+
+def get_bidirectional_pipeline_mirror_group_size():
+    assert (
+        _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP is not None
+    ), 'bidirectional pipeline mirror group is not initialized'
+    return torch.distributed.get_world_size(group=get_bidirectional_pipeline_mirror_group())
+
+def get_fourdirectional_pipeline_mirror_group():
+    """Get the pipeline model parallel group the caller rank belongs to."""
+    assert (
+        _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP is not None
+    ), 'fourdirectional pipeline mirror group is not initialized'
+    return _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP
+
+def get_fourdirectional_pipeline_mirror_group_size():
+    assert (
+        _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP is not None
+    ), 'FOURdirectional pipeline mirror group is not initialized'
+    return torch.distributed.get_world_size(group=get_fourdirectional_pipeline_mirror_group())
 
 
 def get_data_parallel_group(with_context_parallel=False):
@@ -606,6 +714,10 @@ def get_embedding_group():
     assert _EMBEDDING_GROUP is not None, 'embedding group is not initialized'
     return _EMBEDDING_GROUP
 
+def get_main_embedding_group():
+    """Get the main embedding group the caller rank belongs to."""
+    assert _MAIN_EMBEDDING_GROUP is not None, 'main embedding group is not initialized'
+    return _MAIN_EMBEDDING_GROUP
 
 def get_position_embedding_group():
     """Get the position embedding group the caller rank belongs to."""
@@ -718,6 +830,15 @@ def set_pipeline_model_parallel_rank(rank):
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = rank
 
+def set_bidirectional_pipeline_current_rank(rank):
+    """Set bidirectional pipeline mirror rank."""
+    global _MPU_BIDERECTIONAL_PIPELINE_CURRENT_RANK
+    _MPU_BIDERECTIONAL_PIPELINE_CURRENT_RANK = rank
+
+def set_fourdirectional_pipeline_current_rank(rank):
+    """Set bidirectional pipeline mirror rank."""
+    global _MPU_FOURDERECTIONAL_PIPELINE_CURRENT_RANK
+    _MPU_FOURDERECTIONAL_PIPELINE_CURRENT_RANK = rank
 
 def set_pipeline_model_parallel_split_rank(rank):
     """Set pipeline model parallel split rank."""
@@ -740,6 +861,25 @@ def get_pipeline_model_parallel_rank():
         return _MPU_PIPELINE_MODEL_PARALLEL_RANK
     return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
 
+def get_bidirectional_pipeline_mirror_rank():
+    """Return the rank in mirrored group, 0 or 1"""
+    return torch.distributed.get_rank(group=get_bidirectional_pipeline_mirror_group())
+
+def get_bidirectioanl_pipeline_current_rank():
+    global _MPU_BIDERECTIONAL_PIPELINE_CURRENT_RANK
+    if _MPU_BIDERECTIONAL_PIPELINE_CURRENT_RANK is not None:
+        return _MPU_BIDERECTIONAL_PIPELINE_CURRENT_RANK
+    return get_pipeline_model_parallel_rank()
+
+def get_fourdirectional_pipeline_mirror_rank():
+    """Return the rank in mirrored group, 0 or 1"""
+    return torch.distributed.get_rank(group=get_fourdirectional_pipeline_mirror_group())
+
+def get_fourdirectioanl_pipeline_current_rank():
+    global _MPU_FOURDERECTIONAL_PIPELINE_CURRENT_RANK
+    if _MPU_FOURDERECTIONAL_PIPELINE_CURRENT_RANK is not None:
+        return _MPU_FOURDERECTIONAL_PIPELINE_CURRENT_RANK
+    return get_pipeline_model_parallel_rank()
 
 def get_pipeline_model_parallel_split_rank():
     """Return pipeline model parallel split rank."""
@@ -747,8 +887,13 @@ def get_pipeline_model_parallel_split_rank():
     return _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
 
 
-def is_pipeline_first_stage(ignore_virtual=False):
+def is_pipeline_first_stage(ignore_virtual=False, ignore_direction = False):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
+    # 当是该rank中的第一个virtual stage且是流水线中一个rank返回true 
+    if is_bidirectional_pipeline() and not ignore_direction:
+        return is_bidirectional_pipeline_first_stage(ignore_virtual)
+    if is_fourdirectional_pipeline() and not ignore_direction:
+        return is_fourdirectional_pipeline_first_stage(ignore_virtual)
     if not ignore_virtual:
         if (
             get_virtual_pipeline_model_parallel_world_size() is not None
@@ -757,9 +902,25 @@ def is_pipeline_first_stage(ignore_virtual=False):
             return False
     return get_pipeline_model_parallel_rank() == 0
 
+def is_bidirectional_pipeline_first_stage(ignore_virtual=False):
+    global _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP 
+    if _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP is not None:
+        return get_bidirectioanl_pipeline_current_rank() == 0
+    return is_pipeline_first_stage(ignore_virtual)
 
-def is_pipeline_last_stage(ignore_virtual=False):
+def is_fourdirectional_pipeline_first_stage(ignore_virtual=False):
+    global _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP 
+    if _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP is not None:
+        return get_fourdirectioanl_pipeline_current_rank() == 0
+    return is_pipeline_first_stage(ignore_virtual)
+
+def is_pipeline_last_stage(ignore_virtual=False, ignore_direction = False):
     """Return True if in the last pipeline model-parallel stage, False otherwise."""
+    # 当是该rank中的最后一个个virtual stage且是流水线中最后一个rank返回true
+    if is_bidirectional_pipeline() and not ignore_direction:
+        return is_bidirectional_pipeline_last_stage()
+    if is_fourdirectional_pipeline() and not ignore_direction:
+        return is_fourdirectional_pipeline_last_stage()
     if not ignore_virtual:
         virtual_pipeline_model_parallel_world_size = (
             get_virtual_pipeline_model_parallel_world_size()
@@ -770,9 +931,22 @@ def is_pipeline_last_stage(ignore_virtual=False):
             return False
     return get_pipeline_model_parallel_rank() == (get_pipeline_model_parallel_world_size() - 1)
 
+def is_bidirectional_pipeline_last_stage(ignore_virtual = False):
+    global _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP 
+    if _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP is not None:
+        return get_bidirectioanl_pipeline_current_rank() == (get_pipeline_model_parallel_world_size() - 1)
+    return is_pipeline_last_stage(ignore_virtual)
+
+def is_fourdirectional_pipeline_last_stage(ignore_virtual = False):
+    global _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP 
+    if _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP is not None:
+        return get_fourdirectioanl_pipeline_current_rank() == (get_pipeline_model_parallel_world_size() - 1)
+    return is_pipeline_last_stage(ignore_virtual)
 
 def is_rank_in_embedding_group(ignore_virtual=False):
     """Return true if current rank is in embedding group, False otherwise."""
+    if is_fourdirectional_pipeline():
+        return is_fourdirectional_pipeline_first_stage() or is_fourdirectional_pipeline_last_stage()
     rank = torch.distributed.get_rank()
     global _EMBEDDING_GLOBAL_RANKS
     if ignore_virtual:
@@ -785,6 +959,14 @@ def is_rank_in_embedding_group(ignore_virtual=False):
         else:
             return True
     return False
+
+def is_rank_in_main_embedding_group():
+    """Return true if current rank is in main embedding group, False otherwise."""
+    assert is_fourdirectional_pipeline(), 'only fdpp has main embedding group'
+    rank = torch.distributed.get_rank()
+    global _MAIN_EMBEDDING_GLOBAL_RANKS
+    return rank in _MAIN_EMBEDDING_GLOBAL_RANKS
+    
 
 
 def is_rank_in_position_embedding_group():
@@ -1012,6 +1194,10 @@ def destroy_model_parallel():
     _TENSOR_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
+    global _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP
+    _BIDIRECTIONAL_PIPELINE_MIRROR_GROUP = None
+    global _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP
+    _FOURDIRECTIONAL_PIPELINE_MIRROR_GROUP = None
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
     global _DATA_PARALLEL_GROUP_WITH_CP

@@ -5,6 +5,9 @@ from typing import Callable, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+import torch.distributed
+from megatron.training.global_vars import get_args
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
@@ -14,9 +17,10 @@ from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_mo
 
 # Types
 Shape = Union[List[int], torch.Size]
+iters = 0
 
 
-def get_forward_backward_func():
+def get_forward_backward_func(bdpipe=False, fdpipe=False):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
 
@@ -97,6 +101,10 @@ def get_forward_backward_func():
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
+        elif bdpipe:
+            forward_backward_func = forward_backward_bidirectional_pipelining
+        elif fdpipe:
+            forward_backward_func = forward_backward_fourdirectional_pipelining
         else:
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
@@ -201,6 +209,7 @@ def forward_step(
             loss, loss_reduced = output_tensor
             output_tensor = loss / num_microbatches
             forward_data_store.append(loss_reduced)
+            # print(loss_reduced)
         else:
             data = loss_func(output_tensor, non_loss_data=True)
             forward_data_store.append(data)
@@ -1066,7 +1075,7 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config):
             output_tensor_grads.append(None)
             continue
         output_tensor_grad = p2p_communication.send_forward_recv_backward(
-            output_tensor, tensor_shape, config
+            output_tensor, True, tensor_shape, config
         )
         output_tensor_grads.append(output_tensor_grad)
     return output_tensor_grads
@@ -1081,7 +1090,7 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
             input_tensors.append(None)
             continue
         input_tensor = p2p_communication.send_backward_recv_forward(
-            input_tensor_grad, tensor_shape, config
+            input_tensor_grad, True, tensor_shape, config
         )
         input_tensors.append(input_tensor)
     return input_tensors
@@ -1338,4 +1347,1347 @@ def forward_backward_pipelining_without_interleaving(
         # embedding all-reduce for pipeline parallelism).
         config.finalize_model_grads_func([model])
 
+    return forward_data_store
+
+def forward_backward_bidirectional_pipelining(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: int = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: bool = None,
+):
+    """Run bidirectional schedule (pipeline run in a mirrored stage), with
+    communication between pipeline stages as needed.
+
+    Returns dictionary with losses if the last stage, empty dict otherwise."""
+    assert isinstance(model, list), "bidirectional pipeline parallelism expected mirrored stages"
+    assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid mirrord stage"
+    assert isinstance(
+        data_iterator, list
+    ), "bidirectional pipeline parallelism expected each mirrored stage to have a data iterator"
+
+    model_type = get_model_type(model[0])
+    if model_type == ModelType.encoder_and_decoder:
+        raise RuntimeError("Interleaving is not supported with an encoder and decoder model.")
+
+    if decoder_seq_length is not None and decoder_seq_length != seq_length:
+        raise RuntimeError(
+            "Interleaving is not supported with a different decoder sequence length."
+        )
+
+    config = get_model_config(model[0])
+    if config.overlap_p2p_comm and config.batch_p2p_comm:
+        raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
+
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    # Disable async grad reductions
+    no_sync_func = config.no_sync_func
+    if isinstance(no_sync_func, list):
+
+        def multi_no_sync():
+            stack = contextlib.ExitStack()
+            for model_chunk_no_sync_func in config.no_sync_func:
+                stack.enter_context(model_chunk_no_sync_func())
+            return stack
+
+        no_sync_func = multi_no_sync
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+    no_sync_context = None
+
+    if config.grad_sync_func is not None and not isinstance(config.grad_sync_func, list):
+        config.grad_sync_func = [config.grad_sync_func for _ in model]
+
+    if config.param_sync_func is not None and not isinstance(config.param_sync_func, list):
+        config.param_sync_func = [config.param_sync_func for _ in model]
+
+    def disable_grad_sync():
+        """Disable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
+
+    def enable_grad_sync():
+        """Enable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
+
+    disable_grad_sync()
+
+    # Model chunk IDs with synchronized grads
+    synchronized_model_chunks = set()
+
+    # 镜像stage的上一stage的激活与下一stage的梯度，下标0是从上往下，下标1是从下往上
+    input_tensors = [[] for _ in range(len(model))]
+    output_tensors = [[] for _ in range(len(model))]
+    forward_data_store = []
+    if not forward_only:
+        output_tensor_grads = [[] for _ in range(len(model))]
+
+    pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+    pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
+
+    if num_microbatches % pipeline_parallel_size != 0:
+        msg = f'number of microbatches ({num_microbatches}) is not divisible by '
+        msg += f'pipeline-model-parallel-size ({pipeline_parallel_size}) '
+        msg += 'when using interleaved schedule'
+        raise RuntimeError(msg)
+
+
+    model_type = get_model_type(model[0])
+    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
+    if config.sequence_parallel:
+        tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+    
+    # TODO 计算warmup阶段的mb数量，当mb数量大于stage数的时候需要考虑。现在的做法是全部都直接往流水线中注入，之后可能有优化空间
+    num_warmup_microbatches = num_microbatches
+
+    # TODO ckpt相关，目前还不知道是什么意思，先找interleaved抄过来
+    max_outstanding_backprops = None
+    if config.num_microbatches_with_partial_activation_checkpoints is not None:
+        max_outstanding_backprops = num_warmup_microbatches + 1
+    
+    def is_first_microbatch_for_model_chunk(microbatch_id):
+        return microbatch_id == get_model_chunk_id(microbatch_id)
+
+    #TODO 先简单的以奇偶区分该mb是从上往下还是从下往上的
+    def get_model_chunk_id(microbatch_id):
+        """Helper method to get the model chunk ID given the iteration number."""
+        model_chunk_id = microbatch_id % 2
+        return model_chunk_id
+    
+    def is_last_microbatch_for_model_chunk(microbatch_id: int) -> bool:
+        # return True
+        model_id = get_model_chunk_id(microbatch_id)
+        return microbatch_id == 2 + model_id
+    
+    def allreduce_grad(model, async_op=False):
+        grads = []
+        for param in model.module.parameters():
+            grad = param.main_grad
+            grads.append(grad.data)
+        if grads:
+            coalesced = _flatten_dense_tensors(grads)
+            torch.distributed.all_reduce(
+                coalesced, group=parallel_state.get_bidirectional_pipeline_mirror_group(), async_op=async_op
+            )
+            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+                buf.copy_(synced)
+    
+    def reduce_grad(model, model_id, async_op=False):
+        grads = []
+        for param in model.module.parameters():
+            grad = param.main_grad
+            grads.append(grad.data)
+        if grads:
+            coalesced = _flatten_dense_tensors(grads)
+            if model_id == 0:
+                torch.distributed.reduce(
+                    coalesced, 
+                    dst=torch.distributed.get_process_group_ranks(parallel_state.get_bidirectional_pipeline_mirror_group())[pipeline_parallel_rank // 2], 
+                    group=parallel_state.get_bidirectional_pipeline_mirror_group(), 
+                    async_op=async_op
+                )
+            else:
+                torch.distributed.reduce(
+                    coalesced, 
+                    dst=torch.distributed.get_process_group_ranks(parallel_state.get_bidirectional_pipeline_mirror_group())[1-pipeline_parallel_rank // 2], 
+                    group=parallel_state.get_bidirectional_pipeline_mirror_group(), 
+                    async_op=async_op
+                )
+            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+                buf.copy_(synced)
+
+    def allreduce_param(model, async_op=False):
+        params = []
+        for param in model.module.parameters():
+            params.append(param.data)
+        if params:
+            coalesced = _flatten_dense_tensors(params)
+            torch.distributed.all_reduce(
+                coalesced, group=parallel_state.get_bidirectional_pipeline_mirror_group(), async_op=async_op
+            )
+            for buf, synced in zip(params, _unflatten_dense_tensors(coalesced, params)):
+                synced = synced / pipeline_parallel_size
+                buf.copy_(synced)
+
+
+    def forward_step_helper(microbatch_id, checkpoint_activations_microbatch=None):
+        """Helper method to run forward step with model split into chunks
+        (run set_virtual_pipeline_model_parallel_rank() before calling
+        forward_step())."""
+        model_chunk_id = get_model_chunk_id(microbatch_id)
+        if model_chunk_id == 0:
+            parallel_state.set_bidirectional_pipeline_current_rank(pipeline_parallel_rank)
+        else:
+            parallel_state.set_bidirectional_pipeline_current_rank(pipeline_parallel_size - 1 - pipeline_parallel_rank)
+
+        # forward step
+        if parallel_state.is_bidirectional_pipeline_first_stage():
+                input_tensors[model_chunk_id].append(None)
+        input_tensor = input_tensors[model_chunk_id][-1]
+
+        output_tensor = forward_step(
+            forward_step_func,
+            data_iterator[model_chunk_id],
+            model[model_chunk_id],
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            checkpoint_activations_microbatch,
+            check_first_val_step(
+                first_val_step, forward_only, is_first_microbatch_for_model_chunk(microbatch_id),
+            ),
+        )
+        output_tensors[model_chunk_id].append(output_tensor)
+
+        # if forward-only, no need to save tensors for a backward pass
+        if forward_only:
+            input_tensors[model_chunk_id].pop()
+            output_tensors[model_chunk_id].pop()
+
+        return output_tensor
+
+    def backward_step_helper(microbatch_id, sync_grad = False):
+        """Helper method to run backward step with model split into chunks
+        (run set_virtual_pipeline_model_parallel_rank() before calling
+        backward_step())."""
+        model_chunk_id = get_model_chunk_id(microbatch_id)
+        if model_chunk_id == 0:
+            parallel_state.set_bidirectional_pipeline_current_rank(pipeline_parallel_rank)
+        else:
+            parallel_state.set_bidirectional_pipeline_current_rank(pipeline_parallel_size - 1 - pipeline_parallel_rank)
+
+        # launch grad synchronization (default)
+        if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(microbatch_id):
+            enable_grad_sync()
+            synchronized_model_chunks.add(model_chunk_id)
+
+        if parallel_state.is_bidirectional_pipeline_last_stage():
+            if len(output_tensor_grads[model_chunk_id]) == 0:
+                output_tensor_grads[model_chunk_id].append(None)
+        input_tensor = input_tensors[model_chunk_id].pop(0)
+        output_tensor = output_tensors[model_chunk_id].pop(0)
+        output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
+        input_tensor_grad = backward_step(
+            input_tensor, output_tensor, output_tensor_grad, model_type, config
+        )
+
+        # launch grad synchronization (custom grad sync)
+        # Note: Asynchronous communication tends to slow down compute.
+        # To reduce idling from mismatched microbatch times, we launch
+        # asynchronous communication at the same time across the
+        # pipeline-parallel group.
+        if config.grad_sync_func is not None:
+            grad_sync_microbatch_id = microbatch_id - pipeline_parallel_rank
+            if grad_sync_microbatch_id >= 0 and is_last_microbatch_for_model_chunk(
+                grad_sync_microbatch_id
+            ):
+                grad_sync_chunk_id = get_model_chunk_id(grad_sync_microbatch_id, forward=False)
+                enable_grad_sync()
+                config.grad_sync_func[grad_sync_chunk_id](model[grad_sync_chunk_id].parameters())
+                synchronized_model_chunks.add(grad_sync_chunk_id)
+        disable_grad_sync()
+
+        # 梯度同步
+        if sync_grad is True:
+            if get_args().zero1_bidirectional_pipeline is False:
+                allreduce_grad(model[model_chunk_id], False)
+            else:
+                reduce_grad(model[model_chunk_id],model_chunk_id,False)
+            # allreduce_param(model[model_chunk_id], False)
+        return input_tensor_grad
+
+     # Decide to checkpoint all layers' activations of the current micro-batch
+    if max_outstanding_backprops is not None:
+        checkpoint_activations_microbatch = (
+            0 % max_outstanding_backprops
+            >= config.num_microbatches_with_partial_activation_checkpoints
+        )
+    else:
+        checkpoint_activations_microbatch = None
+
+    if pipeline_parallel_rank == 0:
+        fwd_order = [0, 2, 1, 3]
+        bwd_order = [1, 3, 0, 2]
+    elif pipeline_parallel_rank == 1:
+        fwd_order = [0, 1, 2, 3]
+        bwd_order = [1, 0, 3, 2]
+    elif pipeline_parallel_rank == 2:
+        fwd_order = [1, 0, 3, 2]
+        bwd_order = [0, 1, 2, 3]
+    elif pipeline_parallel_rank == 3:
+        fwd_order = [1, 3, 0, 2]
+        bwd_order = [0, 2, 1, 3]
+    def fwd_ptr_inc(fwd_ptr):
+        fwd_ptr += 1
+        fwd_ptr = fwd_ptr % 4
+        return fwd_ptr
+
+    def bwd_ptr_inc(bwd_ptr):
+        bwd_ptr += 1
+        bwd_ptr = bwd_ptr % 4
+        return bwd_ptr
+    
+    fwd_ptr = 0
+    bwd_ptr = 0
+    for i in range(num_microbatches // 4):
+        if i==0:
+            if pipeline_parallel_rank == 0:
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                p2p_communication.send_forward(output_tensor, config)
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_forward_recv_backward(
+                        output_tensor,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            elif pipeline_parallel_rank == 3:
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                p2p_communication.send_backward(output_tensor, config)
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_backward_recv_forward(
+                        output_tensor,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            elif pipeline_parallel_rank == 1:
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(p2p_communication.recv_forward(tensor_shape,config))
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_forward_recv_backward(
+                        output_tensor,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_backward_recv_forward(
+                        output_tensor,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            elif pipeline_parallel_rank == 2:
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(p2p_communication.recv_backward(tensor_shape,config))
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_backward_recv_forward(
+                        output_tensor,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_forward_recv_backward(
+                        output_tensor,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+        else:
+            if pipeline_parallel_rank == 0:
+                output_tensor1=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                output_tensor2=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                    p2p_communication.send_forward_recv_backward(
+                        output_tensor1,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor1, config.deallocate_pipeline_outputs)
+                input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+                bwd_ptr=bwd_ptr_inc(bwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_forward_recv_backward(
+                        output_tensor2,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor2, config.deallocate_pipeline_outputs)
+            elif pipeline_parallel_rank == 3:
+                output_tensor1=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                output_tensor2=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                    p2p_communication.send_backward_recv_forward(
+                        output_tensor1,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor1, config.deallocate_pipeline_outputs)
+                input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+                bwd_ptr=bwd_ptr_inc(bwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_backward_recv_forward(
+                        output_tensor2,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor2, config.deallocate_pipeline_outputs)
+            elif pipeline_parallel_rank==1:
+                input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+                bwd_ptr=bwd_ptr_inc(bwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_backward_recv_forward(
+                        input_tensor_grad,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_forward_recv_backward(
+                        output_tensor,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_backward_recv_forward(
+                        output_tensor,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            elif pipeline_parallel_rank==2:
+                input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+                bwd_ptr=bwd_ptr_inc(bwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_forward_recv_backward(
+                        input_tensor_grad,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_backward_recv_forward(
+                        output_tensor,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                    p2p_communication.send_forward_recv_backward(
+                        output_tensor,
+                        True,
+                        tensor_shape,
+                        config
+                    )
+                )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+
+        if pipeline_parallel_rank == 0:
+            output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+            fwd_ptr=fwd_ptr_inc(fwd_ptr)
+            input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr])
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                p2p_communication.send_forward_recv_backward(
+                    input_tensor_grad,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+            fwd_ptr=fwd_ptr_inc(fwd_ptr)
+            input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr], i==(num_microbatches//4-1))
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                p2p_communication.send_forward_recv_backward(
+                    input_tensor_grad,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr])
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+        elif pipeline_parallel_rank == 3:
+            output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+            fwd_ptr=fwd_ptr_inc(fwd_ptr)
+            input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr])
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                p2p_communication.send_backward_recv_forward(
+                    input_tensor_grad,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+            fwd_ptr=fwd_ptr_inc(fwd_ptr)
+            input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr], i==(num_microbatches//4-1))
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                p2p_communication.send_backward_recv_forward(
+                    input_tensor_grad,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr])
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+        elif pipeline_parallel_rank==1:
+            output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+            fwd_ptr=fwd_ptr_inc(fwd_ptr)
+            input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                p2p_communication.send_forward_recv_backward(
+                    output_tensor,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+            fwd_ptr=fwd_ptr_inc(fwd_ptr)
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                p2p_communication.send_backward_recv_forward(
+                    output_tensor,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                p2p_communication.send_forward_recv_backward(
+                    input_tensor_grad,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                p2p_communication.send_backward_recv_forward(
+                    input_tensor_grad,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr],i==(num_microbatches//4 - 1))
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                p2p_communication.send_forward_recv_backward(
+                    input_tensor_grad,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+        elif pipeline_parallel_rank==2:
+            output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+            fwd_ptr=fwd_ptr_inc(fwd_ptr)
+            input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                p2p_communication.send_backward_recv_forward(
+                    output_tensor,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            output_tensor=forward_step_helper(fwd_order[fwd_ptr])
+            fwd_ptr=fwd_ptr_inc(fwd_ptr)
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                p2p_communication.send_forward_recv_backward(
+                    output_tensor,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                p2p_communication.send_backward_recv_forward(
+                    input_tensor_grad,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                p2p_communication.send_forward_recv_backward(
+                    input_tensor_grad,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+            input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr],i==(num_microbatches//4 - 1))
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                p2p_communication.send_backward_recv_forward(
+                    input_tensor_grad,
+                    True,
+                    tensor_shape,
+                    config
+                )
+            )
+    if pipeline_parallel_rank==0:
+        output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(p2p_communication.recv_backward(tensor_shape, config))
+        input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
+        bwd_ptr=bwd_ptr_inc(bwd_ptr)
+    elif pipeline_parallel_rank==3:
+        output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(p2p_communication.recv_forward(tensor_shape, config))
+        input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
+        bwd_ptr=bwd_ptr_inc(bwd_ptr)
+    elif pipeline_parallel_rank==1:
+        input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
+        bwd_ptr=bwd_ptr_inc(bwd_ptr)
+        p2p_communication.send_backward(input_tensor_grad, config)
+    elif pipeline_parallel_rank==2:
+        input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
+        bwd_ptr=bwd_ptr_inc(bwd_ptr)
+        p2p_communication.send_forward(input_tensor_grad, config)
+
+        
+    if config.finalize_model_grads_func is not None and not forward_only:
+    # Finalize model grads (perform full grad all-reduce / reduce-scatter for
+    # data parallelism, layernorm all-reduce for sequence parallelism, and
+    # embedding all-reduce for pipeline parallelism).
+        config.finalize_model_grads_func(model, zero=get_args().zero1_bidirectional_pipeline)
+    
+    global iters
+    # if iters % 100 == 0:
+    #     if parallel_state.is_bidirectional_pipeline_first_stage() is True:
+    #         print(get_attr_wrapped_model(model[0], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight())
+    #         print(get_attr_wrapped_model(model[1], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight())
+    # iters += 1
+    return forward_data_store
+
+
+def forward_backward_fourdirectional_pipelining(
+    *,
+    forward_step_func,
+    data_iterator: Union[Iterator, List[Iterator]],
+    model: Union[torch.nn.Module, List[torch.nn.Module]],
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+    decoder_seq_length: int = None,
+    forward_only: bool = False,
+    collect_non_loss_data: bool = False,
+    first_val_step: bool = None,
+):
+    """Run bidirectional schedule (pipeline run in a mirrored stage), with
+    communication between pipeline stages as needed.
+
+    Returns dictionary with losses if the last stage, empty dict otherwise."""
+    assert isinstance(model, list), "bidirectional pipeline parallelism expected mirrored stages"
+    assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid mirrord stage"
+    assert isinstance(
+        data_iterator, list
+    ), "bidirectional pipeline parallelism expected each mirrored stage to have a data iterator"
+
+    model_type = get_model_type(model[0])
+    if model_type == ModelType.encoder_and_decoder:
+        raise RuntimeError("Interleaving is not supported with an encoder and decoder model.")
+
+    if decoder_seq_length is not None and decoder_seq_length != seq_length:
+        raise RuntimeError(
+            "Interleaving is not supported with a different decoder sequence length."
+        )
+
+    config = get_model_config(model[0])
+    if config.overlap_p2p_comm and config.batch_p2p_comm:
+        raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
+
+    if config.timers is not None:
+        config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    # Disable async grad reductions
+    no_sync_func = config.no_sync_func
+    if isinstance(no_sync_func, list):
+
+        def multi_no_sync():
+            stack = contextlib.ExitStack()
+            for model_chunk_no_sync_func in config.no_sync_func:
+                stack.enter_context(model_chunk_no_sync_func())
+            return stack
+
+        no_sync_func = multi_no_sync
+    if no_sync_func is None:
+        no_sync_func = contextlib.nullcontext
+    no_sync_context = None
+
+    if config.grad_sync_func is not None and not isinstance(config.grad_sync_func, list):
+        config.grad_sync_func = [config.grad_sync_func for _ in model]
+
+    if config.param_sync_func is not None and not isinstance(config.param_sync_func, list):
+        config.param_sync_func = [config.param_sync_func for _ in model]
+
+    def disable_grad_sync():
+        """Disable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is None:
+            no_sync_context = no_sync_func()
+            no_sync_context.__enter__()
+
+    def enable_grad_sync():
+        """Enable asynchronous grad reductions"""
+        nonlocal no_sync_context
+        if no_sync_context is not None:
+            no_sync_context.__exit__(None, None, None)
+            no_sync_context = None
+
+    disable_grad_sync()
+
+    # Model chunk IDs with synchronized grads
+    synchronized_model_chunks = set()
+
+    # 镜像stage的上一stage的激活与下一stage的梯度，下标0是从上往下，下标1是从下往上
+    input_tensors = [[] for _ in range(len(model))]
+    output_tensors = [[] for _ in range(len(model))]
+    forward_data_store = []
+    if not forward_only:
+        output_tensor_grads = [[] for _ in range(len(model))]
+
+    pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+    pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
+
+    if num_microbatches % pipeline_parallel_size != 0:
+        msg = f'number of microbatches ({num_microbatches}) is not divisible by '
+        msg += f'pipeline-model-parallel-size ({pipeline_parallel_size}) '
+        msg += 'when using interleaved schedule'
+        raise RuntimeError(msg)
+
+
+    model_type = get_model_type(model[0])
+    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
+    if config.sequence_parallel:
+        tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+    
+    # TODO 计算warmup阶段的mb数量，当mb数量大于stage数的时候需要考虑。现在的做法是全部都直接往流水线中注入，之后可能有优化空间
+    num_warmup_microbatches = num_microbatches
+
+    # TODO ckpt相关，目前还不知道是什么意思，先找interleaved抄过来
+    max_outstanding_backprops = None
+    if config.num_microbatches_with_partial_activation_checkpoints is not None:
+        max_outstanding_backprops = num_warmup_microbatches + 1
+    
+    def is_first_microbatch_for_model_chunk(microbatch_id):
+        return microbatch_id == get_model_chunk_id(microbatch_id)
+
+    # TODO 以余4的结果计算是哪个model
+    def get_model_chunk_id(microbatch_id):
+        """Helper method to get the model chunk ID given the iteration number."""
+        model_chunk_id = microbatch_id % 4
+        return model_chunk_id
+    
+    def is_last_microbatch_for_model_chunk(microbatch_id: int) -> bool:
+        # return True
+        model_id = get_model_chunk_id(microbatch_id)
+        return microbatch_id == 4 + model_id
+    
+    def allreduce_grad(model, async_op=False):
+        grads = []
+        for param in model.module.parameters():
+            grad = param.main_grad
+            grads.append(grad.data)
+        if grads:
+            coalesced = _flatten_dense_tensors(grads)
+            torch.distributed.all_reduce(
+                coalesced, group=parallel_state.get_fourdirectional_pipeline_mirror_group(), async_op=async_op
+            )
+            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+                buf.copy_(synced)
+    
+    def reduce_grad(model, model_id, async_op=False):
+        grads = []
+        if pipeline_parallel_rank <= 1: 
+            model_order = [0, 1, 2, 3]
+        elif pipeline_parallel_rank <=3:
+            model_order = [1, 0, 3, 2]
+        elif pipeline_parallel_rank <= 5:
+            model_order = [2, 3, 0, 1]
+        else:
+            model_order = [3, 2, 1, 0]
+        for param in model.module.parameters():
+            grad = param.main_grad
+            grads.append(grad.data)
+        if grads:
+            coalesced = _flatten_dense_tensors(grads)
+            torch.distributed.reduce(
+                coalesced, 
+                dst=torch.distributed.get_process_group_ranks(parallel_state.get_fourdirectional_pipeline_mirror_group())[model_order[model_id]], 
+                group=parallel_state.get_fourdirectional_pipeline_mirror_group(), 
+                async_op=async_op
+            )
+            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+                buf.copy_(synced)
+
+    def forward_step_helper(microbatch_id, checkpoint_activations_microbatch=None):
+        """Helper method to run forward step with model split into chunks
+        (run set_virtual_pipeline_model_parallel_rank() before calling
+        forward_step())."""
+        model_chunk_id = get_model_chunk_id(microbatch_id)
+        if model_chunk_id == 0:
+            parallel_state.set_fourdirectional_pipeline_current_rank(pipeline_parallel_rank)
+        elif model_chunk_id == 1:
+            parallel_state.set_fourdirectional_pipeline_current_rank((11-pipeline_parallel_rank)%8)
+        elif model_chunk_id == 2:
+            parallel_state.set_fourdirectional_pipeline_current_rank((4+pipeline_parallel_rank)%8)
+        else:
+            parallel_state.set_fourdirectional_pipeline_current_rank(pipeline_parallel_size - 1 - pipeline_parallel_rank)
+
+        # forward step
+        if parallel_state.is_fourdirectional_pipeline_first_stage():
+                input_tensors[model_chunk_id].append(None)
+        input_tensor = input_tensors[model_chunk_id][-1]
+
+        output_tensor = forward_step(
+            forward_step_func,
+            data_iterator[model_chunk_id],
+            model[model_chunk_id],
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            checkpoint_activations_microbatch,
+            check_first_val_step(
+                first_val_step, forward_only, is_first_microbatch_for_model_chunk(microbatch_id),
+            ),
+        )
+        output_tensors[model_chunk_id].append(output_tensor)
+
+        # if forward-only, no need to save tensors for a backward pass
+        if forward_only:
+            input_tensors[model_chunk_id].pop()
+            output_tensors[model_chunk_id].pop()
+
+        return output_tensor
+
+    def backward_step_helper(microbatch_id, sync_grad = False):
+        """Helper method to run backward step with model split into chunks
+        (run set_virtual_pipeline_model_parallel_rank() before calling
+        backward_step())."""
+        model_chunk_id = get_model_chunk_id(microbatch_id)
+        if model_chunk_id == 0:
+            parallel_state.set_fourdirectional_pipeline_current_rank(pipeline_parallel_rank)
+        elif model_chunk_id == 1:
+            parallel_state.set_fourdirectional_pipeline_current_rank((11-pipeline_parallel_rank)%8)
+        elif model_chunk_id == 2:
+            parallel_state.set_fourdirectional_pipeline_current_rank((4+pipeline_parallel_rank)%8)
+        else:
+            parallel_state.set_fourdirectional_pipeline_current_rank(pipeline_parallel_size - 1 - pipeline_parallel_rank)
+
+        # launch grad synchronization (default)
+        if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(microbatch_id):
+            enable_grad_sync()
+            synchronized_model_chunks.add(model_chunk_id)
+
+        if parallel_state.is_fourdirectional_pipeline_last_stage():
+            if len(output_tensor_grads[model_chunk_id]) == 0:
+                output_tensor_grads[model_chunk_id].append(None)
+        input_tensor = input_tensors[model_chunk_id].pop(0)
+        output_tensor = output_tensors[model_chunk_id].pop(0)
+        output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
+        input_tensor_grad = backward_step(
+            input_tensor, output_tensor, output_tensor_grad, model_type, config
+        )
+
+        # launch grad synchronization (custom grad sync)
+        # Note: Asynchronous communication tends to slow down compute.
+        # To reduce idling from mismatched microbatch times, we launch
+        # asynchronous communication at the same time across the
+        # pipeline-parallel group.
+        if config.grad_sync_func is not None:
+            grad_sync_microbatch_id = microbatch_id - pipeline_parallel_rank
+            if grad_sync_microbatch_id >= 0 and is_last_microbatch_for_model_chunk(
+                grad_sync_microbatch_id
+            ):
+                grad_sync_chunk_id = get_model_chunk_id(grad_sync_microbatch_id, forward=False)
+                enable_grad_sync()
+                config.grad_sync_func[grad_sync_chunk_id](model[grad_sync_chunk_id].parameters())
+                synchronized_model_chunks.add(grad_sync_chunk_id)
+        disable_grad_sync()
+
+        # 梯度同步
+        if sync_grad is True:
+            if get_args().zero1_bidirectional_pipeline is False:
+                allreduce_grad(model[model_chunk_id], False)
+            else:
+                reduce_grad(model[model_chunk_id],model_chunk_id,False)
+            # allreduce_param(model[model_chunk_id], False)
+        return input_tensor_grad
+    
+    is_embbeding_rank = pipeline_parallel_rank in [0, 3, 4, 7]
+
+     # Decide to checkpoint all layers' activations of the current micro-batch
+    if max_outstanding_backprops is not None:
+        checkpoint_activations_microbatch = (
+            0 % max_outstanding_backprops
+            >= config.num_microbatches_with_partial_activation_checkpoints
+        )
+    else:
+        checkpoint_activations_microbatch = None
+    if pipeline_parallel_rank == 0:
+        fwd_order = [0, 4, 1, 2, 5, 6, 3, 7]
+        bwd_order = [3, 7, 2, 1, 6, 5, 0, 4]
+    elif pipeline_parallel_rank == 1:
+        fwd_order = [0, 1, 4, 5, 2, 3, 6, 7]
+        bwd_order = [3, 2, 7, 6, 1, 0, 5, 4]
+    elif pipeline_parallel_rank == 2:
+        fwd_order = [1, 0, 5, 4, 3, 2, 7, 6]
+        bwd_order = [2, 3 ,6, 7, 0, 1, 4, 5]
+    elif pipeline_parallel_rank == 3:
+        fwd_order = [1, 5, 0, 3, 4, 7, 2, 6]
+        bwd_order = [2, 6, 3, 0, 7, 4, 1, 5]
+    elif pipeline_parallel_rank == 4:
+        fwd_order = [2, 6, 3, 0, 7, 4, 1, 5]
+        bwd_order = [1, 5, 0, 3, 4, 7, 2, 6]
+    elif pipeline_parallel_rank == 5:
+        fwd_order = [2, 3, 6, 7, 0, 1, 4, 5]
+        bwd_order = [1, 0, 5, 4, 3, 2, 7, 6]
+    elif pipeline_parallel_rank == 6:
+        fwd_order = [3, 2, 7, 6, 1, 0, 5, 4]
+        bwd_order = [0, 1, 4, 5, 2, 3, 6, 7]
+    elif pipeline_parallel_rank == 7:
+        fwd_order = [3, 7, 2, 1, 6, 5, 0, 4]
+        bwd_order = [0, 4, 1, 2, 5, 6, 3, 7]
+
+    def fwd_ptr_inc(fwd_ptr):
+        fwd_ptr += 1
+        fwd_ptr = fwd_ptr % 8
+        # model_chunk_id = get_model_chunk_id(fwd_order[fwd_ptr])
+        # if model_chunk_id == 0:
+        #     parallel_state.set_fourdirectional_pipeline_current_rank(pipeline_parallel_rank)
+        # elif model_chunk_id == 1:
+        #     parallel_state.set_fourdirectional_pipeline_current_rank((11-pipeline_parallel_rank)%8)
+        # elif model_chunk_id == 2:
+        #     parallel_state.set_fourdirectional_pipeline_current_rank((4+pipeline_parallel_rank)%8)
+        # else:
+        #     parallel_state.set_fourdirectional_pipeline_current_rank(pipeline_parallel_size - 1 - pipeline_parallel_rank)
+        return fwd_ptr
+
+    def bwd_ptr_inc(bwd_ptr):
+        bwd_ptr += 1
+        bwd_ptr = bwd_ptr % 8
+        # model_chunk_id = get_model_chunk_id(bwd_order[bwd_ptr])
+        # if model_chunk_id == 0:
+        #     parallel_state.set_fourdirectional_pipeline_current_rank(pipeline_parallel_rank)
+        # elif model_chunk_id == 1:
+        #     parallel_state.set_fourdirectional_pipeline_current_rank((11-pipeline_parallel_rank)%8)
+        # elif model_chunk_id == 2:
+        #     parallel_state.set_fourdirectional_pipeline_current_rank((4+pipeline_parallel_rank)%8)
+        # else:
+        #     parallel_state.set_fourdirectional_pipeline_current_rank(pipeline_parallel_size - 1 - pipeline_parallel_rank)
+        return bwd_ptr
+    fwd_ptr = 0
+    bwd_ptr = 0
+    for i in range(num_microbatches // 8):
+        if i == 0:
+            if is_embbeding_rank:
+                output_tensor = forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr = fwd_ptr_inc(fwd_ptr)
+                if pipeline_parallel_rank % 2 == 0:
+                    p2p_communication.send_forward(output_tensor, config)
+                else:
+                    p2p_communication.send_backward(output_tensor, config)
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                output_tensor = forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr = fwd_ptr_inc(fwd_ptr)
+                if pipeline_parallel_rank % 2 == 0:
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                                output_tensor,
+                                True,
+                                tensor_shape,
+                                config
+                        )
+                    )
+                else:
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            else:
+                if pipeline_parallel_rank % 2 == 0:
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(p2p_communication.recv_backward(tensor_shape, config))
+                    output_tensor = forward_step_helper(fwd_order[fwd_ptr])
+                    fwd_ptr = fwd_ptr_inc(fwd_ptr)
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                else:
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(p2p_communication.recv_forward(tensor_shape, config))
+                    output_tensor = forward_step_helper(fwd_order[fwd_ptr])
+                    fwd_ptr = fwd_ptr_inc(fwd_ptr)
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                output_tensor = forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr = fwd_ptr_inc(fwd_ptr)
+                if pipeline_parallel_rank % 2 == 0:
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                else:
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+        else:
+            if is_embbeding_rank:
+                output_tensor1 = forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr = fwd_ptr_inc(fwd_ptr)
+                output_tensor2 = forward_step_helper(fwd_order[fwd_ptr])
+                fwd_ptr = fwd_ptr_inc(fwd_ptr)
+                if pipeline_parallel_rank % 2 == 0:
+                    output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                            output_tensor1,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                    deallocate_output_tensor(output_tensor1, config.deallocate_pipeline_outputs)
+                    input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+                    bwd_ptr=bwd_ptr_inc(bwd_ptr)
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                            output_tensor2,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                    deallocate_output_tensor(output_tensor2, config.deallocate_pipeline_outputs)
+                else:
+                    output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                            output_tensor1,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                    deallocate_output_tensor(output_tensor1, config.deallocate_pipeline_outputs)
+                    input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+                    bwd_ptr=bwd_ptr_inc(bwd_ptr)
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                            output_tensor2,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                    deallocate_output_tensor(output_tensor2, config.deallocate_pipeline_outputs)
+            else:
+                input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr])
+                bwd_ptr=bwd_ptr_inc(bwd_ptr)
+                if pipeline_parallel_rank % 2==1:
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                            input_tensor_grad,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                    output_tensor=forward_step_helper(get_model_chunk_id(fwd_order[fwd_ptr]))
+                    fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                    output_tensor=forward_step_helper(get_model_chunk_id(fwd_order[fwd_ptr]))
+                    fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                else:
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                            input_tensor_grad,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                    output_tensor=forward_step_helper(get_model_chunk_id(fwd_order[fwd_ptr]))
+                    fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                    output_tensor=forward_step_helper(get_model_chunk_id(fwd_order[fwd_ptr]))
+                    fwd_ptr=fwd_ptr_inc(fwd_ptr)
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                
+                    
+        for j in range(5):
+            output_tensor = forward_step_helper(fwd_order[fwd_ptr])
+            fwd_ptr = fwd_ptr_inc(fwd_ptr)
+            if j < 4 or not is_embbeding_rank:
+                if (j % 2) == (pipeline_parallel_rank % 2):
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                else:
+                    input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+                deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+        torch.distributed.barrier()
+        if is_embbeding_rank:
+            input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr])
+            bwd_ptr = bwd_ptr_inc(bwd_ptr)
+            if pipeline_parallel_rank % 2 == 0:
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                            input_tensor_grad,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+            else:
+                input_tensors[get_model_chunk_id(fwd_order[fwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                            input_tensor_grad,
+                            True,
+                            tensor_shape,
+                            config
+                        )
+                    )
+        output_tensor = forward_step_helper(fwd_order[fwd_ptr])
+        fwd_ptr=fwd_ptr_inc(fwd_ptr)
+        if not is_embbeding_rank:
+            if pipeline_parallel_rank % 2 == 0:
+                output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                    p2p_communication.send_forward_recv_backward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                    )
+                )
+            else:
+                output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                    p2p_communication.send_backward_recv_forward(
+                            output_tensor,
+                            True,
+                            tensor_shape,
+                            config
+                    )
+                )
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+            input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr])
+            bwd_ptr = bwd_ptr_inc(bwd_ptr)
+            if pipeline_parallel_rank % 2 == 0:
+                output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                    p2p_communication.send_backward_recv_forward(
+                            input_tensor_grad,
+                            True,
+                            tensor_shape,
+                            config
+                    )
+                )
+            else:
+                output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                    p2p_communication.send_forward_recv_backward(
+                            input_tensor_grad,
+                            True,
+                            tensor_shape,
+                            config
+                    )
+                )
+        last_iter = (i == num_microbatches // 8 - 1)
+        for k in range(6):
+            sync_grad = last_iter and is_last_microbatch_for_model_chunk(bwd_order[bwd_ptr])
+            input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr], sync_grad)
+            bwd_ptr = bwd_ptr_inc(bwd_ptr)
+            if k < 5 or not is_embbeding_rank:
+                if (k % 2) == (pipeline_parallel_rank % 2):
+                    output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                        p2p_communication.send_forward_recv_backward(
+                                input_tensor_grad,
+                                True,
+                                tensor_shape,
+                                config
+                        )
+                    )
+                else:
+                    output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
+                        p2p_communication.send_backward_recv_forward(
+                                input_tensor_grad,
+                                True,
+                                tensor_shape,
+                                config
+                        )
+                    )
+
+            
+    if is_embbeding_rank:
+        if pipeline_parallel_rank % 2 == 0:
+            output_tensor_grads[get_model_chunk_id(bwd_order[-1])].append(p2p_communication.recv_backward(tensor_shape,config))
+        else:
+            output_tensor_grads[get_model_chunk_id(bwd_order[-1])].append(p2p_communication.recv_forward(tensor_shape,config))
+        input_tensor_grad = backward_step_helper(bwd_order[-1], True)
+    if not is_embbeding_rank:
+        if pipeline_parallel_rank % 2 == 0:
+            p2p_communication.send_forward(input_tensor_grad, config)
+        else:
+            p2p_communication.send_backward(input_tensor_grad, config)
+
+
+    if config.finalize_model_grads_func is not None and not forward_only:
+    # Finalize model grads (perform full grad all-reduce / reduce-scatter for
+    # data parallelism, layernorm all-reduce for sequence parallelism, and
+    # embedding all-reduce for pipeline parallelism).
+        config.finalize_model_grads_func(model, zero=get_args().zero1_bidirectional_pipeline)
+    
+    global iters
+    # if iters % 100 == 0:
+    #     if parallel_state.is_bidirectional_pipeline_first_stage() is True:
+    #         print(get_attr_wrapped_model(model[0], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight())
+    #         print(get_attr_wrapped_model(model[1], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight())
+    iters += 1
     return forward_data_store

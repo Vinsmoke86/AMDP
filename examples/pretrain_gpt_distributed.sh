@@ -3,7 +3,8 @@
 # Runs the "345M" parameter model
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
@@ -12,10 +13,10 @@ NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=<Specify path>
-VOCAB_FILE=<Specify path to file>/gpt2-vocab.json
-MERGE_FILE=<Specify path to file>/gpt2-merges.txt
-DATA_PATH=<Specify path and file prefix>_text_document
+
+VOCAB_FILE='/data/gpt2-openwebtext-data/gpt2-vocab.json'
+MERGE_FILE='/data/gpt2-openwebtext-data/gpt2-merges.txt'
+DATA_PATH='/data/gpt2-openwebtext-data/my-gpt2_text_document'
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -26,13 +27,13 @@ DISTRIBUTED_ARGS="
 "
 
 GPT_ARGS="
-    --num-layers 24 \
-    --hidden-size 1024 \
-    --num-attention-heads 16 \
+    --num-layers 48 \
+    --hidden-size 1600 \
+    --num-attention-heads 25 \
     --seq-length 1024 \
     --max-position-embeddings 1024 \
-    --micro-batch-size 8 \
-    --global-batch-size 64 \
+    --micro-batch-size 4 \
+    --global-batch-size 32 \
     --lr 0.00015 \
     --train-iters 500000 \
     --lr-decay-iters 320000 \
@@ -63,5 +64,3 @@ torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
     $DATA_ARGS \
     $OUTPUT_ARGS \
     --distributed-backend nccl \
-    --save $CHECKPOINT_PATH \
-    --load $CHECKPOINT_PATH

@@ -160,6 +160,8 @@ def forward_step(data_iterator, model: GPTModel):
 
 
 def is_dataset_built_on_rank():
+    if get_args().enable_fourdirectional_pipeline:
+        return mpu.get_pipeline_model_parallel_rank() in [0, 3, 4, 7] and mpu.get_tensor_model_parallel_rank() == 0
     return (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and mpu.get_tensor_model_parallel_rank() == 0
 
 

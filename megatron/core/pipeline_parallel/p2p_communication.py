@@ -343,6 +343,7 @@ def _communicate(
         # To protect against race condition when using batch_isend_irecv().
         # User should assert that we have a modern enough PyTorch to not need this
         torch.cuda.synchronize()
+    # reqs=None
 
     return tensor_recv_prev, tensor_recv_next, reqs
 
@@ -354,7 +355,7 @@ def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tens
     See _communicate for argument details.
     """
 
-    if core.parallel_state.is_pipeline_first_stage():
+    if core.parallel_state.is_pipeline_first_stage(ignore_direction=True) and core.parallel_state.is_pipeline_first_stage(ignore_direction=False):
         input_tensor = None
     else:
         if config.timers is not None:
@@ -377,7 +378,7 @@ def recv_backward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Ten
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_last_stage():
+    if core.parallel_state.is_pipeline_last_stage(ignore_direction=True) and core.parallel_state.is_pipeline_last_stage(ignore_direction=False):
         output_tensor_grad = None
     else:
         if config.timers is not None:
@@ -401,7 +402,7 @@ def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> No
     See _communicate for argument details.
     """
 
-    if not core.parallel_state.is_pipeline_last_stage():
+    if not (core.parallel_state.is_pipeline_last_stage(ignore_direction=True) and core.parallel_state.is_pipeline_last_stage(ignore_direction=False)):
         if config.timers is not None:
             config.timers('forward-send', log_level=2).start()
         _communicate(
@@ -421,7 +422,7 @@ def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) 
 
     See _communicate for argument details.
     """
-    if not core.parallel_state.is_pipeline_first_stage():
+    if not (core.parallel_state.is_pipeline_first_stage(ignore_direction=True) and core.parallel_state.is_pipeline_first_stage(ignore_direction=False)):
         if config.timers is not None:
             config.timers('backward-send', log_level=2).start()
         _communicate(
@@ -437,13 +438,13 @@ def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) 
 
 
 def send_forward_recv_backward(
-    output_tensor: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
+    output_tensor: torch.Tensor, recv_next: bool, tensor_shape: Shape, config: ModelParallelConfig
 ) -> torch.Tensor:
     """Batched send and recv with next rank in pipeline.
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_last_stage():
+    if core.parallel_state.is_pipeline_last_stage(ignore_direction=True) and core.parallel_state.is_pipeline_last_stage(ignore_direction=False):
         output_tensor_grad = None
     else:
         if config.timers is not None:
@@ -452,7 +453,7 @@ def send_forward_recv_backward(
             tensor_send_next=output_tensor,
             tensor_send_prev=None,
             recv_prev=False,
-            recv_next=True,
+            recv_next=recv_next,
             tensor_shape=tensor_shape,
             config=config,
         )
@@ -462,13 +463,13 @@ def send_forward_recv_backward(
 
 
 def send_backward_recv_forward(
-    input_tensor_grad: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
+    input_tensor_grad: torch.Tensor, recv_prev: bool, tensor_shape: Shape, config: ModelParallelConfig
 ) -> torch.Tensor:
     """Batched send and recv with previous rank in pipeline.
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_first_stage():
+    if core.parallel_state.is_pipeline_first_stage(ignore_direction=True) and core.parallel_state.is_pipeline_first_stage(ignore_direction=False):
         input_tensor = None
     else:
         if config.timers is not None:
@@ -476,7 +477,7 @@ def send_backward_recv_forward(
         input_tensor, _, _ = _communicate(
             tensor_send_next=None,
             tensor_send_prev=input_tensor_grad,
-            recv_prev=True,
+            recv_prev=recv_prev,
             recv_next=False,
             tensor_shape=tensor_shape,
             config=config,

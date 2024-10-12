@@ -1233,6 +1233,14 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--enable-bidirectional-pipeline', action='store_true', default=False,
+                       help='If set, use bidirectional pipeline')
+    group.add_argument('--enable-fourdirectional-pipeline', action='store_true', default=False,
+                       help='If set, use fourdirectional pipeline')
+    group.add_argument('--enable-asynchronous-pipeline', action='store_true', default=False,
+                       help='If set, use asynchronous pipeline')
+    group.add_argument('--zero1-bidirectional-pipeline', action='store_true', default=False,
+                       help='If set, use zero1 in bidirectional pipeline')
     group.add_argument('--pipeline-model-parallel-split-rank',
                        type=int, default=None,
                        help='Rank where encoder and decoder should be split.')

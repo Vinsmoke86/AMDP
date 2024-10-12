@@ -10,7 +10,7 @@ from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
 
 
-def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
+def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig, zero=False):
     """
     All-reduce word embedding grads.
 
@@ -36,9 +36,32 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
         # TODO: Clean this up once the wrapper classes inherit from core MegatronModule.
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
         if model_module.share_embeddings_and_output_weights:
-            weight = model_module.shared_embedding_or_output_weight()
-            grad = weight.main_grad
-            torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
+            if parallel_state.is_bidirectional_pipeline():
+                if zero:
+                    if parallel_state.is_bidirectional_pipeline_first_stage():
+                        weight = get_attr_wrapped_model(model[0], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
+                        grad = weight.main_grad
+                        torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
+                else:
+                    weight_0 = get_attr_wrapped_model(model[0], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
+                    weight_1 = get_attr_wrapped_model(model[1], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
+                    weight_0.main_grad += weight_1.main_grad
+                    weight_1.main_grad  = weight_0.main_grad
+            elif parallel_state.is_fourdirectional_pipeline():
+                if zero:
+                    if parallel_state.is_rank_in_main_embedding_group():
+                        weight = get_attr_wrapped_model(model[0], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
+                        grad = weight.main_grad
+                        torch.distributed.all_reduce(grad, group=parallel_state.get_main_embedding_group())
+                else:
+                    weight_0 = get_attr_wrapped_model(model[parallel_state.get_pipeline_model_parallel_rank // 2], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
+                    weight_1 = get_attr_wrapped_model(model[-(1 + parallel_state.get_pipeline_model_parallel_rank // 2)], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
+                    weight_0.main_grad += weight_1.main_grad
+                    weight_1.main_grad  = weight_0.main_grad
+            else:
+                weight = model_module.shared_embedding_or_output_weight()
+                grad = weight.main_grad
+                torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
 
 
 def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
@@ -59,11 +82,11 @@ def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: Tr
         torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
 
 
-def _allreduce_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
+def _allreduce_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig, zero=False):
     """
     All-reduce both word and position embeddings.
     """
-    _allreduce_word_embedding_grads(model, config)
+    _allreduce_word_embedding_grads(model, config, zero)
     _allreduce_position_embedding_grads(model, config)
 
 
@@ -96,7 +119,7 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                 buf.copy_(synced)
 
 
-def finalize_model_grads(model: List[torch.nn.Module]):
+def finalize_model_grads(model: List[torch.nn.Module], zero=False):
     """
     All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
     embedding grads across first and last pipeline stages (if not tied).
@@ -126,6 +149,6 @@ def finalize_model_grads(model: List[torch.nn.Module]):
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
-    _allreduce_embedding_grads(model, config)
+    _allreduce_embedding_grads(model, config, zero)
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
