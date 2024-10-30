@@ -684,14 +684,14 @@ def train_step(forward_step_func, data_iterator,
                 model_order = [0, 1]
             else:
                 model_order = [1, 0]
-            for i in model_order:
+            for index, element in enumerate(model_order):
                 params = []
-                for param in model[i].module.parameters():
+                for param in model[element].module.parameters():
                     params.append(param.data)
                 if params:
                     coalesced = _flatten_dense_tensors(params)
                     torch.distributed.broadcast(
-                        coalesced, src=torch.distributed.get_process_group_ranks(mpu.get_bidirectional_pipeline_mirror_group())[0], group=mpu.get_bidirectional_pipeline_mirror_group()
+                        coalesced, src=torch.distributed.get_process_group_ranks(mpu.get_bidirectional_pipeline_mirror_group())[index], group=mpu.get_bidirectional_pipeline_mirror_group()
                     )
                     for buf, synced in zip(params, _unflatten_dense_tensors(coalesced, params)):
                         buf.copy_(synced)
@@ -705,14 +705,14 @@ def train_step(forward_step_func, data_iterator,
                 model_order = [2, 3, 0, 1]
             else:
                 model_order = [3, 2, 1, 0]
-            for i in model_order:
+            for index, element in enumerate(model_order):
                 params = []
-                for param in model[i].module.parameters():
+                for param in model[element].module.parameters():
                     params.append(param.data)
                 if params:
                     coalesced = _flatten_dense_tensors(params)
                     torch.distributed.broadcast(
-                        coalesced, src=torch.distributed.get_process_group_ranks(mpu.get_fourdirectional_pipeline_mirror_group())[0], group=mpu.get_fourdirectional_pipeline_mirror_group()
+                        coalesced, src=torch.distributed.get_process_group_ranks(mpu.get_fourdirectional_pipeline_mirror_group())[index], group=mpu.get_fourdirectional_pipeline_mirror_group()
                     )
                     for buf, synced in zip(params, _unflatten_dense_tensors(coalesced, params)):
                         buf.copy_(synced)

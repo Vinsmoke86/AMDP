@@ -496,7 +496,7 @@ def initialize_model_parallel(
         pp_group = get_pipeline_model_parallel_group()
         pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
         for i in range(pp_size // 4):
-            ranks = [pp_ranks[i], pp_ranks[i + 4], pp_ranks[- 5 - i], pp_ranks[- 1 - i]]
+            ranks = [pp_ranks[i], pp_ranks[- 5 - i], pp_ranks[i + 4], pp_ranks[- 1 - i]]
             group = torch.distributed.new_group(
                 ranks,
                 timeout=timeout,

@@ -1432,8 +1432,8 @@ def forward_backward_bidirectional_pipelining(
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
     forward_data_store = []
-    if not forward_only:
-        output_tensor_grads = [[] for _ in range(len(model))]
+    # if not forward_only:
+    output_tensor_grads = [[] for _ in range(len(model))]
 
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -1566,6 +1566,8 @@ def forward_backward_bidirectional_pipelining(
         """Helper method to run backward step with model split into chunks
         (run set_virtual_pipeline_model_parallel_rank() before calling
         backward_step())."""
+        if forward_only:
+            return None
         model_chunk_id = get_model_chunk_id(microbatch_id)
         if model_chunk_id == 0:
             parallel_state.set_bidirectional_pipeline_current_rank(pipeline_parallel_rank)
@@ -1736,7 +1738,7 @@ def forward_backward_bidirectional_pipelining(
                 output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                     p2p_communication.send_forward_recv_backward(
                         output_tensor1,
-                        True,
+                        not forward_only,
                         tensor_shape,
                         config
                     )
@@ -1761,7 +1763,7 @@ def forward_backward_bidirectional_pipelining(
                 output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                     p2p_communication.send_backward_recv_forward(
                         output_tensor1,
-                        True,
+                        not forward_only,
                         tensor_shape,
                         config
                     )
@@ -1865,7 +1867,7 @@ def forward_backward_bidirectional_pipelining(
             output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                 p2p_communication.send_forward_recv_backward(
                     input_tensor_grad,
-                    True,
+                    not forward_only,
                     tensor_shape,
                     config
                 )
@@ -1892,7 +1894,7 @@ def forward_backward_bidirectional_pipelining(
             output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                 p2p_communication.send_backward_recv_forward(
                     input_tensor_grad,
-                    True,
+                    not forward_only,
                     tensor_shape,
                     config
                 )
@@ -1916,7 +1918,7 @@ def forward_backward_bidirectional_pipelining(
             output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                 p2p_communication.send_backward_recv_forward(
                     output_tensor,
-                    True,
+                    not forward_only,
                     tensor_shape,
                     config
                 )
@@ -1927,7 +1929,7 @@ def forward_backward_bidirectional_pipelining(
             output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                 p2p_communication.send_forward_recv_backward(
                     input_tensor_grad,
-                    True,
+                    not forward_only,
                     tensor_shape,
                     config
                 )
@@ -1937,7 +1939,7 @@ def forward_backward_bidirectional_pipelining(
             output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                 p2p_communication.send_backward_recv_forward(
                     input_tensor_grad,
-                    True,
+                    not forward_only,
                     tensor_shape,
                     config
                 )
@@ -1947,7 +1949,7 @@ def forward_backward_bidirectional_pipelining(
             output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                 p2p_communication.send_forward_recv_backward(
                     input_tensor_grad,
-                    True,
+                    not forward_only,
                     tensor_shape,
                     config
                 )
@@ -1969,7 +1971,7 @@ def forward_backward_bidirectional_pipelining(
             output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                 p2p_communication.send_forward_recv_backward(
                     output_tensor,
-                    True,
+                    not forward_only,
                     tensor_shape,
                     config
                 )
@@ -1980,7 +1982,7 @@ def forward_backward_bidirectional_pipelining(
             output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                 p2p_communication.send_backward_recv_forward(
                     input_tensor_grad,
-                    True,
+                    not forward_only,
                     tensor_shape,
                     config
                 )
@@ -1990,7 +1992,7 @@ def forward_backward_bidirectional_pipelining(
             output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                 p2p_communication.send_forward_recv_backward(
                     input_tensor_grad,
-                    True,
+                    not forward_only,
                     tensor_shape,
                     config
                 )
@@ -2000,27 +2002,28 @@ def forward_backward_bidirectional_pipelining(
             output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                 p2p_communication.send_backward_recv_forward(
                     input_tensor_grad,
-                    True,
+                    not forward_only,
                     tensor_shape,
                     config
                 )
             )
-    if pipeline_parallel_rank==0:
-        output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(p2p_communication.recv_backward(tensor_shape, config))
-        input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
-        bwd_ptr=bwd_ptr_inc(bwd_ptr)
-    elif pipeline_parallel_rank==3:
-        output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(p2p_communication.recv_forward(tensor_shape, config))
-        input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
-        bwd_ptr=bwd_ptr_inc(bwd_ptr)
-    elif pipeline_parallel_rank==1:
-        input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
-        bwd_ptr=bwd_ptr_inc(bwd_ptr)
-        p2p_communication.send_backward(input_tensor_grad, config)
-    elif pipeline_parallel_rank==2:
-        input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
-        bwd_ptr=bwd_ptr_inc(bwd_ptr)
-        p2p_communication.send_forward(input_tensor_grad, config)
+    if not forward_only:
+        if pipeline_parallel_rank==0:
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(p2p_communication.recv_backward(tensor_shape, config))
+            input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+        elif pipeline_parallel_rank==3:
+            output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(p2p_communication.recv_forward(tensor_shape, config))
+            input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+        elif pipeline_parallel_rank==1:
+            input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            p2p_communication.send_backward(input_tensor_grad, config)
+        elif pipeline_parallel_rank==2:
+            input_tensor_grad=backward_step_helper(bwd_order[bwd_ptr], True)
+            bwd_ptr=bwd_ptr_inc(bwd_ptr)
+            p2p_communication.send_forward(input_tensor_grad, config)
 
         
     if config.finalize_model_grads_func is not None and not forward_only:
@@ -2121,8 +2124,8 @@ def forward_backward_fourdirectional_pipelining(
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
     forward_data_store = []
-    if not forward_only:
-        output_tensor_grads = [[] for _ in range(len(model))]
+    # if not forward_only:
+    output_tensor_grads = [[] for _ in range(len(model))]
 
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -2245,6 +2248,8 @@ def forward_backward_fourdirectional_pipelining(
         """Helper method to run backward step with model split into chunks
         (run set_virtual_pipeline_model_parallel_rank() before calling
         backward_step())."""
+        if forward_only:
+            return None
         model_chunk_id = get_model_chunk_id(microbatch_id)
         if model_chunk_id == 0:
             parallel_state.set_fourdirectional_pipeline_current_rank(pipeline_parallel_rank)
@@ -2575,7 +2580,6 @@ def forward_backward_fourdirectional_pipelining(
                         )
                     )
                 deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
-        torch.distributed.barrier()
         if is_embbeding_rank:
             input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr])
             bwd_ptr = bwd_ptr_inc(bwd_ptr)
@@ -2604,7 +2608,7 @@ def forward_backward_fourdirectional_pipelining(
                 output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                     p2p_communication.send_forward_recv_backward(
                             output_tensor,
-                            True,
+                            not forward_only,
                             tensor_shape,
                             config
                     )
@@ -2613,7 +2617,7 @@ def forward_backward_fourdirectional_pipelining(
                 output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                     p2p_communication.send_backward_recv_forward(
                             output_tensor,
-                            True,
+                            not forward_only,
                             tensor_shape,
                             config
                     )
@@ -2625,7 +2629,7 @@ def forward_backward_fourdirectional_pipelining(
                 output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                     p2p_communication.send_backward_recv_forward(
                             input_tensor_grad,
-                            True,
+                            not forward_only,
                             tensor_shape,
                             config
                     )
@@ -2634,7 +2638,7 @@ def forward_backward_fourdirectional_pipelining(
                 output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                     p2p_communication.send_forward_recv_backward(
                             input_tensor_grad,
-                            True,
+                            not forward_only,
                             tensor_shape,
                             config
                     )
@@ -2649,7 +2653,7 @@ def forward_backward_fourdirectional_pipelining(
                     output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                         p2p_communication.send_forward_recv_backward(
                                 input_tensor_grad,
-                                True,
+                                not forward_only,
                                 tensor_shape,
                                 config
                         )
@@ -2658,24 +2662,24 @@ def forward_backward_fourdirectional_pipelining(
                     output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                         p2p_communication.send_backward_recv_forward(
                                 input_tensor_grad,
-                                True,
+                                not forward_only,
                                 tensor_shape,
                                 config
                         )
                     )
 
-            
-    if is_embbeding_rank:
-        if pipeline_parallel_rank % 2 == 0:
-            output_tensor_grads[get_model_chunk_id(bwd_order[-1])].append(p2p_communication.recv_backward(tensor_shape,config))
-        else:
-            output_tensor_grads[get_model_chunk_id(bwd_order[-1])].append(p2p_communication.recv_forward(tensor_shape,config))
+    if not forward_only:
+        if is_embbeding_rank:
+            if pipeline_parallel_rank % 2 == 0:
+                output_tensor_grads[get_model_chunk_id(bwd_order[-1])].append(p2p_communication.recv_backward(tensor_shape,config))
+            else:
+                output_tensor_grads[get_model_chunk_id(bwd_order[-1])].append(p2p_communication.recv_forward(tensor_shape,config))
         input_tensor_grad = backward_step_helper(bwd_order[-1], True)
-    if not is_embbeding_rank:
-        if pipeline_parallel_rank % 2 == 0:
-            p2p_communication.send_forward(input_tensor_grad, config)
-        else:
-            p2p_communication.send_backward(input_tensor_grad, config)
+        if not is_embbeding_rank:
+            if pipeline_parallel_rank % 2 == 0:
+                p2p_communication.send_forward(input_tensor_grad, config)
+            else:
+                p2p_communication.send_backward(input_tensor_grad, config)
 
 
     if config.finalize_model_grads_func is not None and not forward_only:
