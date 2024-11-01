@@ -22,7 +22,7 @@ _TRAIN_START_TIME = time.time()
 import torch
 
 from megatron.core import mpu, tensor_parallel
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_model_config, get_attr_wrapped_model
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.legacy.model import Float16Module
@@ -517,6 +517,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # 没啥规律，一个个rank写得了
     if args.enable_fourdirectional_pipeline:
         rank = mpu.get_pipeline_model_parallel_rank()
+        if rank==0 or rank==7:
+            weight = get_attr_wrapped_model(model[0], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
+            torch.distributed.broadcast(weight, src=torch.distributed.get_process_group_ranks(mpu.get_main_embedding_group())[0], group=mpu.get_main_embedding_group())
         if rank <= 1: 
             model_order = [0, 1, 2, 3]
         elif rank <=3:
@@ -525,13 +528,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model_order = [2, 3, 0, 1]
         else:
             model_order = [3, 2, 1, 0]
-        for i in model_order:
-            for param in model[i].module.parameters():
+        for index, element in enumerate(model_order):
+            params = []
+            for param in model[element].module.parameters():
+                params.append(param.data)
+            if params:
+                coalesced = _flatten_dense_tensors(params)
                 torch.distributed.broadcast(
-                    param.data,
-                    src=torch.distributed.get_process_group_ranks(mpu.get_fourdirectional_pipeline_mirror_group())[0],
-                    group=mpu.get_fourdirectional_pipeline_mirror_group()
+                    coalesced, src=torch.distributed.get_process_group_ranks(mpu.get_fourdirectional_pipeline_mirror_group())[index], group=mpu.get_fourdirectional_pipeline_mirror_group()
                 )
+                for buf, synced in zip(params, _unflatten_dense_tensors(coalesced, params)):
+                    buf.copy_(synced)
 
     print(torch.distributed.get_rank(), 'barrier2')
     torch.distributed.barrier()

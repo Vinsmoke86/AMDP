@@ -1184,7 +1184,6 @@ def async_train_fourdirectional_pipeline(
     model_type = get_model_type(model[0])
     tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
     tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
-    itertions = 0
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
     
@@ -1195,7 +1194,6 @@ def async_train_fourdirectional_pipeline(
     max_outstanding_backprops = None
     if config.num_microbatches_with_partial_activation_checkpoints is not None:
         max_outstanding_backprops = num_warmup_microbatches + 1
-    
     
     def is_first_microbatch_for_model_chunk(microbatch_id):
         return microbatch_id == get_model_chunk_id(microbatch_id)
@@ -1246,7 +1244,7 @@ def async_train_fourdirectional_pipeline(
                 async_op=async_op
             )
             for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
-                buf.copy_(synced / 4)
+                buf.copy_(synced)
 
     def forward_step_helper(microbatch_id, checkpoint_activations_microbatch=None):
         """Helper method to run forward step with model split into chunks
@@ -1710,7 +1708,6 @@ def async_train_fourdirectional_pipeline(
                             )
                         )
                     deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
-            torch.distributed.barrier()
             if is_embbeding_rank:
                 input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr])
                 bwd_ptr = bwd_ptr_inc(bwd_ptr)
@@ -1734,8 +1731,9 @@ def async_train_fourdirectional_pipeline(
                         )
             output_tensor = forward_step_helper(fwd_order[fwd_ptr])
             fwd_ptr=fwd_ptr_inc(fwd_ptr)
-            if iter!=0 and i==0 and not forward_only:
-                update_and_post_process(iter)
+            if is_embbeding_rank:
+                if iter!=0 and i==0 and not forward_only:
+                    update_and_post_process(iter)
             if not is_embbeding_rank:
                 if pipeline_parallel_rank % 2 == 0:
                     output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
@@ -1756,6 +1754,8 @@ def async_train_fourdirectional_pipeline(
                         )
                     )
                 deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+                if iter!=0 and i==0 and not forward_only:
+                    update_and_post_process(iter)
                 input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr])
                 bwd_ptr = bwd_ptr_inc(bwd_ptr)
                 if pipeline_parallel_rank % 2 == 0:
@@ -1779,8 +1779,6 @@ def async_train_fourdirectional_pipeline(
             last_iter = (i == num_microbatches // 8 - 1)
             for k in range(6):
                 sync_grad = last_iter and is_last_microbatch_for_model_chunk(bwd_order[bwd_ptr])
-                # if pipeline_parallel_rank == 7:
-                #     print(k,'  ',iter,' ')
                 input_tensor_grad = backward_step_helper(bwd_order[bwd_ptr], sync_grad)
                 bwd_ptr = bwd_ptr_inc(bwd_ptr)
                 if k < 5 or not is_embbeding_rank:
@@ -1808,7 +1806,7 @@ def async_train_fourdirectional_pipeline(
                 output_tensor_grads[get_model_chunk_id(bwd_order[-1])].append(p2p_communication.recv_backward(tensor_shape,config))
             else:
                 output_tensor_grads[get_model_chunk_id(bwd_order[-1])].append(p2p_communication.recv_forward(tensor_shape,config))
-            input_tensor_grad = backward_step_helper(bwd_order[-1], True)
+        input_tensor_grad = backward_step_helper(bwd_order[-1], True)
         if not is_embbeding_rank:
             if pipeline_parallel_rank % 2 == 0:
                 p2p_communication.send_forward(input_tensor_grad, config)

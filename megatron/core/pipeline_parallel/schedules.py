@@ -2452,7 +2452,7 @@ def forward_backward_fourdirectional_pipelining(
                     output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                         p2p_communication.send_forward_recv_backward(
                             output_tensor1,
-                            True,
+                            not forward_only,
                             tensor_shape,
                             config
                         )
@@ -2473,7 +2473,7 @@ def forward_backward_fourdirectional_pipelining(
                     output_tensor_grads[get_model_chunk_id(bwd_order[bwd_ptr])].append(
                         p2p_communication.send_backward_recv_forward(
                             output_tensor1,
-                            True,
+                            not forward_only,
                             tensor_shape,
                             config
                         )
@@ -2690,8 +2690,8 @@ def forward_backward_fourdirectional_pipelining(
     
     global iters
     # if iters % 100 == 0:
-    #     if parallel_state.is_bidirectional_pipeline_first_stage() is True:
+    #     if pipeline_parallel_rank == 0 or pipeline_parallel_rank == 7:
     #         print(get_attr_wrapped_model(model[0], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight())
-    #         print(get_attr_wrapped_model(model[1], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight())
+    #         print(get_attr_wrapped_model(model[-1], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight())
     iters += 1
     return forward_data_store

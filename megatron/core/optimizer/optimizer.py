@@ -288,11 +288,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         )
 
         # Update across all model parallel instances.
-        args = get_args()
-        if args.enable_asynchronous_pipeline is False:
-            torch.distributed.all_reduce(
-                self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
-            )
+        torch.distributed.all_reduce(
+            self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_model_parallel_group()
+        )
 
         # Check for nan.
         found_inf_flag = self.found_inf.item() > 0

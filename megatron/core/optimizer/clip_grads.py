@@ -96,11 +96,9 @@ def clip_grad_norm_fp32(
                 total_norm += grad_norm ** norm_type
 
         # Sum across all model-parallel GPUs.
-        args = get_args()
-        if args.enable_asynchronous_pipeline is False:
-            torch.distributed.all_reduce(
-                total_norm, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
-            )
+        torch.distributed.all_reduce(
+            total_norm, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
+        )
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
     # Scale.
