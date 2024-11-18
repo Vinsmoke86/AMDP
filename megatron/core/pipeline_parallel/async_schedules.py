@@ -661,7 +661,7 @@ def async_train_bidirectional_pipeline(
 
     for iter in range(iter_num):
         for i in range(num_microbatches // 4):
-            if iter==0:
+            if iter==0 and i==0:
                 if pipeline_parallel_rank == 0:
                     output_tensor=forward_step_helper(fwd_order[fwd_ptr])
                     fwd_ptr=fwd_ptr_inc(fwd_ptr)
@@ -1475,7 +1475,7 @@ def async_train_fourdirectional_pipeline(
     bwd_ptr = 0
     for iter in range(iter_num):
         for i in range(num_microbatches // 8):
-            if iter == 0:
+            if iter == 0 and i == 0:
                 if is_embbeding_rank:
                     output_tensor = forward_step_helper(fwd_order[fwd_ptr])
                     fwd_ptr = fwd_ptr_inc(fwd_ptr)

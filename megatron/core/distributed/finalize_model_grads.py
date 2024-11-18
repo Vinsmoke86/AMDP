@@ -54,8 +54,8 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
                         grad = weight.main_grad
                         torch.distributed.all_reduce(grad, group=parallel_state.get_main_embedding_group())
                 else:
-                    weight_0 = get_attr_wrapped_model(model[parallel_state.get_pipeline_model_parallel_rank // 2], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
-                    weight_1 = get_attr_wrapped_model(model[-(1 + parallel_state.get_pipeline_model_parallel_rank // 2)], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
+                    weight_0 = get_attr_wrapped_model(model[parallel_state.get_pipeline_model_parallel_rank() // 2], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
+                    weight_1 = get_attr_wrapped_model(model[-(1 + parallel_state.get_pipeline_model_parallel_rank() // 2)], 'pre_process', return_model_obj=True).shared_embedding_or_output_weight()
                     weight_0.main_grad += weight_1.main_grad
                     weight_1.main_grad  = weight_0.main_grad
             else:
