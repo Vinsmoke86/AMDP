@@ -542,7 +542,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     print(torch.distributed.get_rank(), 'barrier2')
     torch.distributed.barrier()
-        
+    
+    # size=0
+    # for name, param in model[0].named_parameters():
+    #     size+=param.numel()
+    # print(size)
     return model
 
 

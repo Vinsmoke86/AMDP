@@ -4,11 +4,11 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-GPUS_PER_NODE=4
+# export CUDA_VISIBLE_DEVICES=0,1,2,3
+GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
-MASTER_PORT=6001
+MASTER_PORT=6000
 NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
@@ -26,20 +26,19 @@ DISTRIBUTED_ARGS="
 "
 
 GPT_ARGS="
-    --pipeline-model-parallel-size 4 \
-    --enable-bidirectional-pipeline \
+    --pipeline-model-parallel-size 8 \
     --enable-asynchronous-pipeline \
-    --zero1-bidirectional-pipeline \
+    --weight-predict
     --seed 1234 \
     --num-layers 48 \
     --hidden-size 1600 \
     --num-attention-heads 25 \
     --seq-length 1024 \
     --max-position-embeddings 1024 \
-    --micro-batch-size 1 \
-    --global-batch-size 4 \
+    --micro-batch-size 4 \
+    --global-batch-size 128 \
     --lr 0.00015 \
-    --train-iters 100000 \
+    --train-iters 40000 \
     --lr-decay-iters 320000 \
     --lr-decay-style cosine \
     --min-lr 1.0e-5 \

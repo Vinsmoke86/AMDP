@@ -28,7 +28,7 @@ DISTRIBUTED_ARGS="
 GPT_ARGS="
     --pipeline-model-parallel-size 8 \
     --enable-fourdirectional-pipeline \
-    --zero1-bidirectional-pipeline \
+
     --seed 1234 \
     --num-layers 48 \
     --hidden-size 1600 \
@@ -36,7 +36,7 @@ GPT_ARGS="
     --seq-length 1024 \
     --max-position-embeddings 1024 \
     --micro-batch-size 4 \
-    --global-batch-size 32 \
+    --global-batch-size 128 \
     --lr 0.00015 \
     --train-iters 40000 \
     --lr-decay-iters 320000 \

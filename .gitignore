@@ -5,7 +5,8 @@ build
 *.egg-info
 *~
 slurm*
-logs
+logs*
 .vscode
 torch_test
 *.log
+times_new_romen

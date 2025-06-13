@@ -1239,6 +1239,10 @@ def _add_distributed_args(parser):
                        help='If set, use fourdirectional pipeline')
     group.add_argument('--enable-asynchronous-pipeline', action='store_true', default=False,
                        help='If set, use asynchronous pipeline')
+    group.add_argument('--weight-stash', action='store_true', default=False,
+                       help='If set, use weight stash in asynchronous pipeline')
+    group.add_argument('--weight-predict', action='store_true', default=False,
+                       help='If set, use weight predict in asynchronous pipeline')
     group.add_argument('--zero1-bidirectional-pipeline', action='store_true', default=False,
                        help='If set, use zero1 in bidirectional pipeline')
     group.add_argument('--pipeline-model-parallel-split-rank',

@@ -232,6 +232,62 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     return input_tensor_grad
 
+def model_param_stash(model):
+    copy={}
+    for name,param in model.named_parameters():
+        copy[name]=param.data.clone()
+    return copy
+
+def model_param_free(model, new_param):
+    for name,param in model.named_parameters():
+        param.data=new_param[name]
+
+def model_param_replace(model, new_param, free=False):
+    if not free:
+        copy = {}
+    else:
+        copy = None
+    for name,param in model.named_parameters():
+        if not free:
+            copy[name] = param.data
+        param.data=new_param[name]
+    return copy
+
+eps=1e-10
+def model_param_predict(model, optimizer, step):
+    copy={}
+    lr = optimizer.param_groups[0]['lr']
+    beta1 = optimizer.param_groups[0]['betas'][0]
+    alpha1 = 1 / (1-beta1)
+    beta2 = optimizer.param_groups[0]['betas'][1]
+    alpha2 = 1 / (1-beta2)
+    # print(optimizer.state)
+    for name,param in model.named_parameters():
+        # if(optimizer.state[param]!={}):
+        #     v = optimizer.state[param]['exp_avg']
+        #     m = optimizer.state[param]['exp_avg_sq']
+        #     v_hat = v * alpha1
+        #     m_hat = m * alpha2
+        #     delta_w = v_hat / torch.sqrt(m_hat+eps)
+        #     copy[name] = param.data - step*lr*delta_w
+        # else:
+            copy[name]=param.data.clone()
+    with torch.no_grad():
+        for n, group in enumerate(optimizer.float16_groups):
+            main_group = optimizer.fp32_from_float16_groups[n]
+            for i, main_param in enumerate(main_group):
+                if main_param in optimizer.state:
+                    param=group[i]
+                    v = optimizer.state[main_param]['exp_avg']
+                    m = optimizer.state[main_param]['exp_avg_sq']
+                    v_hat = v * alpha1
+                    m_hat = m * alpha2
+                    delta_w = v_hat / torch.sqrt(m_hat+eps)
+                    delta_w = delta_w.half()
+                    param.data = param.data - step*lr*delta_w
+
+    return copy
+
 
 def check_first_val_step(first_val_step, forward_only, cond):
     if (first_val_step is not None) and forward_only:
@@ -1831,6 +1887,9 @@ def async_train_pipedream_pipeline(
     collect_non_loss_data: bool = False,
     first_val_step: bool = None,
 ):
+    args = get_args()
+    weight_stash=args.weight_stash
+    weight_predict=args.weight_predict
     """Run asynchronous pipedream schedule, with
     communication between pipeline stages as needed.
 
@@ -1892,6 +1951,12 @@ def async_train_pipedream_pipeline(
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
 
+    weight_buffer=None
+    if(weight_stash):
+        weight_buffer=[]
+    if(weight_predict):
+        weight_buffer=[{},{}]
+        first_predict = num_microbatches + pipeline_parallel_size - pipeline_parallel_rank - 1
 
     # Compute number of warmup microbatches.
     num_warmup_microbatches = (
@@ -1899,7 +1964,7 @@ def async_train_pipedream_pipeline(
         - parallel_state.get_pipeline_model_parallel_rank()
         - 1
     )
-    num_microbatches_remaining = iter_num - num_warmup_microbatches
+    num_microbatches_remaining = iter_num*num_microbatches - num_warmup_microbatches
 
     max_outstanding_backprops = None
     if config.num_microbatches_with_partial_activation_checkpoints is not None:
@@ -1910,6 +1975,10 @@ def async_train_pipedream_pipeline(
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
+    input_tensor=None
+    output_tensor=None
+    input_tensor_grad=None
+    output_tensor_grad=None
     if not forward_only:
         input_tensors = []
         output_tensors = []
@@ -1937,15 +2006,77 @@ def async_train_pipedream_pipeline(
     # Model chunk IDs with synchronized grads
     synchronized_model_chunks = set()
 
+    def forward_step_helper(weight_stash, weight_predict, micro_batch_id):
+        if weight_predict:
+            if micro_batch_id % num_microbatches == 0:
+                step = round((pipeline_parallel_size + num_microbatches - pipeline_parallel_rank // 2 - 2) / num_microbatches)
+                copy = model_param_predict(model, optimizer, step)
+            else:
+                copy = model_param_replace(model, weight_buffer[0])
+        output_tensor = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            checkpoint_activations_microbatch,
+            check_first_val_step(first_val_step, forward_only, micro_batch_id == 0),
+        )
+        if weight_stash and micro_batch_id % num_microbatches == 0:
+            weight_buffer.append(model_param_stash(model))
+        if weight_predict:
+            weight_buffer[0] = model_param_replace(model, copy, False)
+        return output_tensor
+
+    def backward_step_helper(weight_stash, weight_predict, micro_batch_id):
+        copy={}
+        if weight_stash:
+            """将参数替换为陈旧参数"""
+            if (micro_batch_id+1) % num_microbatches == 0:
+                old_copy = weight_buffer.pop(0)
+            else:
+                old_copy = weight_buffer[0]
+            for name, param in model.named_parameters():
+                copy[name]=param.data
+                
+                # if(name == 'module.module.language_model.encoder.layers.0.self_attention.dense.weight' and micro_batch_id%10==0 and pipeline_parallel_rank==0):
+                #     print(micro_batch_id,'backward',param)
+                param.data=old_copy[name]
+        if weight_predict:
+            if micro_batch_id % num_microbatches == 0:
+                step = round((num_microbatches + pipeline_parallel_rank // 2 - 1) / num_microbatches)
+                copy = model_param_predict(model, optimizer, step)
+            else:
+                copy = model_param_replace(model, weight_buffer[1])
+        input_tensor_grad = backward_step(
+                input_tensor, output_tensor, output_tensor_grad, model_type, config
+            )
+        if weight_stash:
+            model_param_free(model, copy)
+        if weight_predict:
+            weight_buffer[1] = model_param_replace(model, copy, False)
+        return input_tensor_grad
+
     def update_and_post_process(iteration):
         # Empty unused memory.
         if args.empty_unused_memory_level >= 1:
             torch.cuda.empty_cache()
-
+        # for name, param in model.named_parameters():
+        #     if(name == 'module.module.language_model.encoder.layers.0.self_attention.dense.weight' and iteration%10==0 and pipeline_parallel_rank==0):
+        #             print(iteration,'preupdate',id(param.data))
         # Update parameters.
         timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
         timers('optimizer').stop()
+        # if weight_stash:
+        #     weight_buffer.append(model_param_stash(model))
+
+        # for name, param in model.named_parameters():
+        #     if(name == 'module.module.language_model.encoder.layers.0.self_attention.dense.weight' and iteration%10==0 and pipeline_parallel_rank==0):
+        #             print(iteration,'postupdate',id(param.data))
 
         # Update learning rate.
         if update_successful:
@@ -1978,7 +2109,8 @@ def async_train_pipedream_pipeline(
         #     track_e2e_metrics()
         nonlocal report_memory_flag
         batch_size = parallel_state.get_data_parallel_world_size() * \
-                        args.micro_batch_size
+                        args.micro_batch_size* \
+                        num_microbatches
         args.consumed_train_samples += batch_size
         report_memory_flag = training_log(loss_reduced, total_loss_dict,
                                             optimizer.param_groups[0]['lr'],
@@ -2002,18 +2134,7 @@ def async_train_pipedream_pipeline(
             checkpoint_activations_microbatch = None
 
         input_tensor = p2p_communication.recv_forward(tensor_shape, config)
-        output_tensor = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            checkpoint_activations_microbatch,
-            check_first_val_step(first_val_step, forward_only, i == 0),
-        )
+        output_tensor = forward_step_helper(weight_stash, weight_predict, i)
         p2p_communication.send_forward(output_tensor, config)
 
         if not forward_only:
@@ -2028,8 +2149,8 @@ def async_train_pipedream_pipeline(
         input_tensor = p2p_communication.recv_forward(tensor_shape, config)
 
     # Run 1F1B in steady state.
-    for i in range(1, num_microbatches_remaining + 1):
-        last_iteration = i == (num_microbatches_remaining)
+    for i in range(0, num_microbatches_remaining):
+        last_iteration = i == (num_microbatches_remaining-1)
 
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
@@ -2039,20 +2160,7 @@ def async_train_pipedream_pipeline(
         else:
             checkpoint_activations_microbatch = None
 
-        output_tensor = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            checkpoint_activations_microbatch,
-            check_first_val_step(
-                first_val_step, forward_only, (i == 1) and (num_warmup_microbatches == 0)
-            ),
-        )
+        output_tensor = forward_step_helper(weight_stash, weight_predict, i+num_warmup_microbatches)
         output_tensor_grad = None
         if forward_only:
             p2p_communication.send_forward(output_tensor, config)
@@ -2084,12 +2192,10 @@ def async_train_pipedream_pipeline(
                 if config.grad_sync_func is None or pipeline_parallel_rank == 0:
                     enable_grad_sync()
 
-            input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
-            )
-            # if i % num_microbatches == 0:
-            #     update_and_post_process(i // num_microbatches)
-            update_and_post_process(i)
+            input_tensor_grad = backward_step_helper(weight_stash, weight_predict,i)
+            if (i+1) % num_microbatches == 0 :
+                update_and_post_process((i+1) // num_microbatches)
+            # update_and_post_process(i)
 
             if last_iteration:
                 input_tensor = None
@@ -2121,10 +2227,9 @@ def async_train_pipedream_pipeline(
 
             output_tensor_grad = p2p_communication.recv_backward(tensor_shape, config)
 
-            input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
-            )
-            update_and_post_process(i + num_microbatches_remaining + 1)
+            input_tensor_grad = backward_step_helper(weight_stash, weight_predict,i+num_microbatches_remaining)
+            if(i + num_microbatches_remaining + 1) % num_microbatches == 0 :
+                update_and_post_process((i + num_microbatches_remaining + 1) % num_microbatches)
 
             p2p_communication.send_backward(input_tensor_grad, config)
 

@@ -1,24 +1,42 @@
 #!/bin/bash
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+export CUDA_VISIBLE_DEVICES=7
+GPUS_PER_NODE=1
+# Change for multinode config
+MASTER_ADDR=localhost
+MASTER_PORT=6001
+NNODES=1
+NODE_RANK=0
+WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=<Specify path>
-VOCAB_FILE=<Specify path to file>/bert-vocab.txt
-DATA_PATH=<Specify path and file prefix>_text_sentence
+# CHECKPOINT_PATH=<Specify path>
+VOCAB_FILE='/data/enwiki/bert-large-cased-vocab.txt'
+DATA_PATH='/data/enwiki/my-bert_text_sentence'
+
+DISTRIBUTED_ARGS="
+    --nproc_per_node $GPUS_PER_NODE \
+    --nnodes $NNODES \
+    --node_rank $NODE_RANK \
+    --master_addr $MASTER_ADDR \
+    --master_port $MASTER_PORT
+"
 
 BERT_ARGS="
-    --num-layers 24 \
-    --hidden-size 1024 \
-    --num-attention-heads 16 \
+    --pipeline-model-parallel-size 1 \
+    --num-layers 32 \
+    --hidden-size 1600 \
+    --num-attention-heads 32 \
     --seq-length 512 \
     --max-position-embeddings 512 \
     --micro-batch-size 4 \
-    --global-batch-size 8 \
+    --global-batch-size 32 \
     --lr 0.0001 \
-    --train-iters 2000000 \
+    --train-iters 1000000 \
     --lr-decay-iters 990000 \
     --lr-decay-style linear \
-    --min-lr 0.00001 \
+    --min-lr 1.0e-5 \
     --weight-decay 1e-2 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
@@ -38,9 +56,10 @@ OUTPUT_ARGS="
     --eval-iters 10
 "
 
-torchrun pretrain_bert.py \
+torchrun $DISTRIBUTED_ARGS pretrain_bert.py \
     $BERT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
-    --save $CHECKPOINT_PATH \
-    --load $CHECKPOINT_PATH
+    --distributed-backend nccl 
+    # --save $CHECKPOINT_PATH \
+    # --load $CHECKPOINT_PATH
